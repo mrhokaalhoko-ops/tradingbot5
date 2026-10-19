@@ -543,6 +543,10 @@ def start_webapp(state_manager=None, client=None, port: int = 8080):
     server = make_server("0.0.0.0", port, app, threaded=True)
     handle = WebAppServerHandle(server)
     handle.start()
-    host_url = os.getenv("WEBAPP_PUBLIC_URL", f"http://localhost:{port}")
+    host_url = (
+        os.getenv("WEBAPP_PUBLIC_URL")
+        or os.getenv("WEBAPP_URL")
+        or f"http://localhost:{port}"
+    )
     logger.info(f"[WebApp] Dashboard running at {host_url}")
     return handle

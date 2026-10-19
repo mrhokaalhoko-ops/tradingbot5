@@ -372,11 +372,18 @@ class TelegramNotifier:
     # ==========================================================
     # GUI Keyboards
     # ==========================================================
+    def _webapp_url(self) -> str:
+        """Return the one canonical HTTPS URL used by all Mini App buttons."""
+        url = str(getattr(Config, "WEBAPP_URL", "") or "").strip()
+        if not url.startswith("https://"):
+            raise RuntimeError("WEBAPP_URL must be configured with an HTTPS URL")
+        return url.rstrip("/") + "/"
+
     def main_menu_keyboard(self):
         """
         القائمة الرئيسية التفاعلية.
         """
-        web_url = os.getenv("WEBAPP_URL", "https://tradingbot-production-0b71.up.railway.app/")
+        web_url = self._webapp_url()
         return {
             "inline_keyboard": [
                 [
@@ -1078,18 +1085,34 @@ class TelegramNotifier:
         """
         if not self._is_configured():
             return
-        payload = {
+        webapp_url = self._webapp_url()
+        default_payload = {
             "menu_button": {
                 "type": "web_app",
                 "text": "Open",
-                "web_app": {"url": os.getenv("WEBAPP_URL", "https://tradingbot-production-0b72.up.railway.app/")}
+                "web_app": {"url": webapp_url}
             }
         }
-        try:
-            requests.post(f"{self.base_url}/setChatMenuButton", json=payload, timeout=5)
-            logger.info("[WebApp] تم ضبط زر Mini App كزر القائمة الرئيسي بنجاح.")
-        except Exception as e:
-            logger.debug(f"[WebApp] فشل ضبط زر Mini App: {e}")
+        chat_payload = dict(default_payload)
+        chat_payload["chat_id"] = self.chat_id
+
+        default_result = self._post("setChatMenuButton", default_payload, timeout=5)
+        chat_result = self._post("setChatMenuButton", chat_payload, timeout=5)
+        default_ok = isinstance(default_result, dict) and default_result.get("ok") is True
+        chat_ok = isinstance(chat_result, dict) and chat_result.get("ok") is True
+
+        if default_ok and chat_ok:
+            logger.info(
+                "[WebApp] Mini App menu button confirmed for default and authorized chat: %s",
+                webapp_url,
+            )
+        else:
+            logger.error(
+                "[WebApp] Mini App menu button was not confirmed "
+                "(default_ok=%s chat_ok=%s).",
+                default_ok,
+                chat_ok,
+            )
 
 
     def send_api_status_report(self, client, state_manager):
@@ -2228,7 +2251,7 @@ class TelegramNotifier:
         - إذا وُجدت عملات أعطت إشارة ورُفضت → تُعرض مع السبب (مفيدة للمراقبة)
         - إذا لا توجد أي إشارات → رسالة قصيرة نظيفة مع زر Dashboard
         """
-        webapp_url = getattr(Config, "WEBAPP_URL", "https://tradingbot-production-0b71.up.railway.app/")
+        webapp_url = self._webapp_url()
 
         # المرشح ليس مجرد REJECT: قد يكون في انتظار تصحيح/تأكيد/تحسن RR.
         # ``pipeline_progress_pct`` يقيس مراحل المسار التي اجتازها فقط، وليس

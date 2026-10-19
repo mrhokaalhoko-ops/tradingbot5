@@ -166,6 +166,13 @@ class Config:
     # Telegram Config
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    # Canonical public URL used by every Telegram Mini App entry point.  Keep
+    # the environment variable authoritative so a Railway migration cannot
+    # leave individual buttons pointing at an obsolete deployment.
+    WEBAPP_URL = os.getenv(
+        "WEBAPP_URL", "https://tradingbot5-production.up.railway.app/"
+    ).strip()
+    WEBAPP_PUBLIC_URL = os.getenv("WEBAPP_PUBLIC_URL", WEBAPP_URL).strip()
 
     # إعدادات التداول الافتراضية
     TRADE_SYMBOL = "BTC/USDT"
