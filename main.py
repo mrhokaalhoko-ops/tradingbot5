@@ -830,20 +830,6 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
          "expected_entry": current_price, "profile": filter_profile.get("key")},
     )
 
-    if (
-        Config.TELEGRAM_PROPOSAL_DEMO_MODE
-        and not Config.DEMO_EXECUTION_ENABLED
-    ):
-        _execution_event(
-            "DEMO_EXECUTION_DISABLED",
-            {"order_calls_possible": False},
-            durable=True,
-        )
-        logger.warning(
-            f"[{symbol}] Demo proposal execution is disabled; no proposal or order was emitted."
-        )
-        return False
-
     # لا يمكن لأي caller مستقبلي تجاوز استرداد startup أو حالة state تالفة.
     if state_manager.get("recovery_complete", True) is not True:
         logger.critical(f"[{symbol}] رُفض التنفيذ: استرداد التشغيل غير مكتمل.")
@@ -1175,6 +1161,38 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
             target_plan=target_plan,
         )
         coin_data["user_visible_trade_proposal"] = proposal
+
+    # تعطيل إرسال أوامر Demo لا يعطّل تحليل السوق أو عرض الاقتراحات. ننشر
+    # الاقتراح النهائي بعد اكتمال جميع فحوص الاستراتيجية/المخاطر، ثم نتوقف
+    # قبل حفظ نية إرسال أمر وقبل Entry POST. بذلك تبقى واجهة Telegram قابلة
+    # للمراجعة في وضع observation-only مع ضمان order_calls_possible=false.
+    if (
+        Config.TELEGRAM_PROPOSAL_DEMO_MODE
+        and not Config.DEMO_EXECUTION_ENABLED
+    ):
+        proposal_visible = bool(
+            proposal
+            and _publish_authoritative_trade_proposal(
+                state_manager=state_manager,
+                notifier=notifier,
+                proposal=proposal,
+                audit_ids=audit_ids,
+            )
+        )
+        _execution_event(
+            "DEMO_EXECUTION_DISABLED",
+            {
+                "order_calls_possible": False,
+                "proposal_id": proposal.get("proposal_id") if proposal else None,
+                "proposal_visible": proposal_visible,
+            },
+            durable=True,
+        )
+        logger.info(
+            f"[{symbol}] Demo execution disabled; proposal_visible="
+            f"{proposal_visible}; no order intent or Entry POST was created."
+        )
+        return False
 
     intent_saved = state_manager.save_order_intent(symbol, {
         "trade_id": trade_id,
@@ -7920,12 +7938,6 @@ def _scanner_thread(
     last_scan_time = int(time.time() * 1000)
 
     while not _shutdown_event.is_set():
-        if (
-            Config.TELEGRAM_PROPOSAL_DEMO_MODE
-            and not Config.DEMO_EXECUTION_ENABLED
-        ):
-            _shutdown_event.wait(timeout=5.0)
-            continue
         scan_interval = int(
             state_manager.get(
                 "scan_interval_seconds",

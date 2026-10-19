@@ -841,6 +841,22 @@ class ExchangeClient:
         """تنفيذ صفقة حقيقية على المنصة وتحديد الرافعة المالية صراحةً"""
         self.last_execution_failure = None
         send_attempted = False
+        # Defense in depth: observation-only Telegram mode may analyze and
+        # publish proposals, but no caller may reach leverage mutation or an
+        # Entry POST while Demo execution is disabled.
+        if (
+            Config.TELEGRAM_PROPOSAL_DEMO_MODE
+            and not Config.DEMO_EXECUTION_ENABLED
+        ):
+            self._set_execution_failure(
+                "DEMO_EXECUTION_DISABLED",
+                symbol,
+                send_attempted=False,
+            )
+            logger.info(
+                f"[{symbol}] Entry blocked by observation-only Demo guard."
+            )
+            return None
         try:
             exchange_symbol, contract_market = self._resolve_usdm_contract_market(symbol)
             if not exchange_symbol or not contract_market:
