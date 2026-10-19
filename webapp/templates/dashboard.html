@@ -1,0 +1,2089 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>حمزاوي || Trader — لوحة التحكم</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet" />
+  <style>
+    /* ═══════════════════════════════════════
+       TOKENS (BINANCE TERMINAL THEME)
+    ═══════════════════════════════════════ */
+    :root {
+      --bg: #0B0E11;          /* خلفية كربونية داكنة جداً */
+      --bg2: #12161C;
+      --surface: #181B22;     /* سطح البطاقات */
+      --surface2: #1E2329;    /* سطح ثانوي */
+      --surface3: #262B33;
+      --border: #2B2F36;      /* حدود صلبة */
+      --border2: #3A3F47;
+
+      --gold: #F0B90B;        /* اللون الذهبي الأساسي */
+      --gold-dim: rgba(240, 185, 11, .15);
+      --gold-glow: rgba(240, 185, 11, .4);
+
+      --green: #0ECB81;       /* أخضر نيون */
+      --green-dim: rgba(14, 203, 129, .15);
+
+      --red: #F6465D;         /* أحمر قرمزي */
+      --red-dim: rgba(246, 70, 93, .15);
+
+      --cyan: #4A8FDB;        /* أزرق سماوي للبيانات الثانوية */
+      --cyan-dim: rgba(74, 143, 219, .15);
+
+      --text: #EAECEF;        /* نص أبيض صافي */
+      --text2: #848E9C;       /* نص رمادي */
+      --text3: #5E6673;       /* نص خافت */
+
+      --r-sm: 4px;            /* زوايا حادة */
+      --r-md: 6px;
+      --r-lg: 8px;
+      --r-xl: 12px;
+
+      --transition: 0.15s cubic-bezier(0.4, 0, 0.2, 1); /* انتقالات سريعة */
+    }
+
+    /* ═══════════════════════════════════════
+       RESET & BASE
+    ═══════════════════════════════════════ */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Cairo', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    button { touch-action: manipulation; }
+
+    button:focus-visible,
+    summary:focus-visible,
+    .clickable-symbol:focus-visible {
+      outline: 3px solid var(--cyan);
+      outline-offset: 2px;
+    }
+
+    .mono {
+      font-family: 'JetBrains Mono', monospace;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.5px;
+    }
+
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
+    ::-webkit-scrollbar-track {
+      background: var(--bg2);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: var(--border2);
+      border-radius: 0;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--gold);
+    }
+
+    /* ═══════════════════════════════════════
+       HEADER (SOLID & SHARP)
+    ═══════════════════════════════════════ */
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      padding: 0 16px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .header::after {
+      content: "";
+      position: absolute;
+      bottom: -1px;
+      left: 0;
+      width: 100%;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+      opacity: .3;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-img {
+      width: 32px;
+      height: 32px;
+      object-fit: contain;
+      flex-shrink: 0;
+    }
+
+    .header-name {
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: .3px;
+      color: var(--text);
+    }
+
+    .header-sub {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 2px;
+      letter-spacing: 0.5px;
+    }
+
+    .live-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--green-dim);
+      border: 1px solid var(--green);
+      color: var(--green);
+      padding: 4px 10px 4px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: blink 1s steps(2, start) infinite;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+
+    /* ═══════════════════════════════════════
+       LAYOUT SHELL
+    ═══════════════════════════════════════ */
+    .content {
+      position: relative;
+      z-index: 1;
+      padding: 16px 12px 80px;
+      max-width: 520px;
+      margin: 0 auto;
+    }
+
+    /* ═══════════════════════════════════════
+       SECTION HEADER
+    ═══════════════════════════════════════ */
+    .section-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 24px 0 8px;
+      padding: 0 4px;
+    }
+
+    .section-head .icon {
+      width: 24px;
+      height: 24px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+    }
+
+    .section-head .icon img {
+      width: 14px;
+      height: 14px;
+      object-fit: contain;
+    }
+
+    .section-head .label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .section-head .count-badge {
+      margin-right: auto;
+      background: var(--surface);
+      border: 1px solid var(--border2);
+      color: var(--text2);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: var(--r-sm);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* ═══════════════════════════════════════
+       KPI STRIP (TERMINAL STYLE)
+    ═══════════════════════════════════════ */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: 12px 14px;
+      position: relative;
+      transition: border-color var(--transition), background var(--transition);
+      clip-path: polygon(0 0, 100% 0, 100% 100%, 8px 100%, 0 calc(100% - 8px)); /* زاوية سفلية يسرى مقصوصة */
+    }
+
+    .kpi:hover {
+      background: var(--surface2);
+      border-color: var(--border2);
+    }
+
+    .kpi:active {
+      transform: scale(0.98);
+    }
+
+    .kpi::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 2px;
+      height: 100%;
+      transition: width var(--transition);
+    }
+
+    .kpi:hover::before {
+      width: 4px;
+    }
+
+    .kpi.v::before { background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+    .kpi.c::before { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+    .kpi.g::before { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .kpi.r::before { background: var(--red); box-shadow: 0 0 8px var(--red); }
+    .kpi.y::before { background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+
+    .kpi-label {
+      font-size: 9px;
+      color: var(--text3);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      margin-bottom: 8px;
+    }
+
+    .kpi-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 22px;
+      font-weight: 600;
+      line-height: 1;
+      transition: color 0.3s ease;
+    }
+
+    .kpi-sub {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 6px;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .kpi-sub .pos { color: var(--green); }
+    .kpi-sub .neg { color: var(--red); }
+
+    .col-v { color: var(--gold); }
+    .col-c { color: var(--cyan); }
+    .col-g { color: var(--green); }
+    .col-r { color: var(--red); }
+    .col-y { color: var(--gold); }
+
+    /* ═══════════════════════════════════════
+       WALLET CARD (HERO)
+    ═══════════════════════════════════════ */
+    .wallet-hero {
+      background: var(--surface);
+      border: 1px solid var(--gold);
+      border-radius: var(--r-lg);
+      padding: 20px;
+      margin-bottom: 6px;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 0 20px rgba(240, 185, 11, 0.05);
+    }
+
+    .wallet-hero::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+    }
+
+    .wallet-title {
+      font-size: 10px;
+      color: var(--text2);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .wallet-title::before {
+      content: "";
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      background: var(--gold);
+    }
+
+    .balance-display {
+      text-align: center;
+      padding: 10px 0 16px;
+      border-bottom: 1px dashed var(--border2);
+      margin-bottom: 16px;
+    }
+
+    .balance-amount {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 36px;
+      font-weight: 700;
+      color: var(--gold);
+      letter-spacing: -1px;
+      line-height: 1;
+      transition: text-shadow 0.3s ease;
+    }
+
+    .balance-unit {
+      font-size: 12px;
+      color: var(--text3);
+      font-weight: 600;
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .wallet-rows {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .wallet-stat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 10px 12px;
+      transition: border-color var(--transition);
+    }
+
+    .wallet-stat:hover {
+      border-color: var(--border2);
+    }
+
+    .wallet-stat-label {
+      font-size: 9px;
+      color: var(--text3);
+      margin-bottom: 4px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .wallet-stat-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    /* ═══════════════════════════════════════
+       CHART CARD
+    ═══════════════════════════════════════ */
+    .chart-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: 12px;
+      margin-bottom: 6px;
+    }
+
+    .chart-card canvas {
+      max-height: 160px;
+      animation: chartFadeIn 0.3s ease-out;
+    }
+
+    @keyframes chartFadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    /* ═══════════════════════════════════════
+       OPEN POSITIONS
+    ═══════════════════════════════════════ */
+    .pos-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: 12px;
+      margin-bottom: 6px;
+      transition: border-color var(--transition), background var(--transition);
+    }
+
+    .pos-card:hover {
+      background: var(--surface2);
+      border-color: var(--border2);
+    }
+
+    .pos-dir {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--r-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: .5px;
+      flex-shrink: 0;
+      border: 1px solid;
+    }
+
+    .pos-dir.long {
+      background: var(--green-dim);
+      color: var(--green);
+      border-color: var(--green);
+    }
+
+    .pos-dir.short {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: var(--red);
+    }
+
+    .pos-body { flex: 1; min-width: 0; }
+
+    .pos-pair {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.2;
+      color: var(--text);
+    }
+
+    .pos-meta {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 4px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .pos-meta span {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .pos-meta .sl { color: var(--red); }
+    .pos-meta .tp { color: var(--green); }
+
+    .pos-right {
+      text-align: left;
+      flex-shrink: 0;
+    }
+
+    .pos-pnl {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .pos-time {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 3px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .tp1-tag {
+      display: inline-block;
+      background: var(--gold-dim);
+      color: var(--gold);
+      border: 1px solid var(--gold);
+      border-radius: var(--r-sm);
+      font-size: 9px;
+      font-weight: 800;
+      padding: 1px 6px;
+      margin-top: 4px;
+    }
+
+    /* ═══════════════════════════════════════
+       TRADES TABLE
+    ═══════════════════════════════════════ */
+    .trades-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      overflow: hidden;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .trades-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .trades-table thead tr {
+      background: var(--bg);
+    }
+
+    .trades-table th {
+      font-size: 10px;
+      color: var(--text3);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      padding: 10px 12px;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .trades-table td {
+      padding: 10px 12px;
+      font-size: 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+      transition: background 0.1s ease;
+    }
+
+    @media (max-width: 420px) {
+      .trades-table td, .trades-table th { padding: 8px 6px; }
+      .td-pnl { font-size: 11px; }
+      .trades-table th { font-size: 9px; }
+    }
+
+    .trades-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .trades-table tbody tr:hover td {
+      background: var(--surface2);
+    }
+
+    .trade-pair {
+      font-weight: 700;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--text);
+    }
+
+    .trade-time {
+      font-size: 10px;
+      color: var(--text3);
+      margin-top: 2px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .dir-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 8px;
+      border-radius: var(--r-sm);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .3px;
+      border: 1px solid;
+    }
+
+    .dir-tag.long {
+      background: var(--green-dim);
+      color: var(--green);
+      border-color: var(--green);
+    }
+
+    .dir-tag.short {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: var(--red);
+    }
+
+    .td-pnl {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      min-width: 70px;
+    }
+
+    .td-roe {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      white-space: nowrap;
+      min-width: 58px;
+      font-weight: 600;
+    }
+
+    .td-entry {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text2);
+      white-space: nowrap;
+    }
+
+    /* ═══════════════════════════════════════
+       EMPTY STATE
+    ═══════════════════════════════════════ */
+    .empty {
+      text-align: center;
+      padding: 30px 16px;
+      color: var(--text3);
+      background: var(--surface);
+      border: 1px dashed var(--border2);
+      border-radius: var(--r-md);
+    }
+
+    .empty-icon {
+      font-size: 30px;
+      display: block;
+      margin-bottom: 8px;
+      opacity: 0.5;
+    }
+
+    .empty-text {
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    /* ═══════════════════════════════════════
+       BOTTOM BAR
+    ═══════════════════════════════════════ */
+    .bottom-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: var(--bg);
+      border-top: 1px solid var(--border);
+      padding: 12px 16px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .last-update {
+      font-size: 10px;
+      color: var(--text3);
+      line-height: 1.4;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .last-update strong {
+      display: block;
+      color: var(--text2);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .refresh-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 44px;
+      background: var(--gold);
+      border: none;
+      color: #000;
+      padding: 10px 24px;
+      border-radius: var(--r-sm);
+      font-family: 'Cairo', sans-serif;
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform var(--transition), box-shadow var(--transition), opacity 0.2s;
+      white-space: nowrap;
+      flex-shrink: 0;
+      clip-path: polygon(0 0, 100% 0, 100% 70%, 90% 100%, 0 100%); /* زاوية مقصوصة */
+    }
+
+    .refresh-btn:hover {
+      box-shadow: 0 0 15px var(--gold-glow);
+      transform: translateY(-1px);
+    }
+
+    .refresh-btn:active {
+      transform: translateY(0) scale(0.97);
+    }
+
+    .refresh-btn.loading {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+
+    .refresh-icon {
+      display: inline-block;
+      font-size: 14px;
+    }
+
+    .refresh-btn.loading .refresh-icon {
+      animation: spin .8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @keyframes pulse-gold {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* ═══════════════════════════════════════
+       INITIAL LOADER
+    ═══════════════════════════════════════ */
+    .init-loader {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 80px 20px;
+      gap: 16px;
+    }
+
+    .loader-ring {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      border-top-color: var(--gold);
+      border-right-color: var(--gold);
+      animation: spin .8s linear infinite;
+    }
+
+    .loader-text {
+      font-size: 12px;
+      color: var(--text3);
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+
+    /* ═══════════════════════════════════════
+       ERROR STATE
+    ═══════════════════════════════════════ */
+    .error-state {
+      background: var(--red-dim);
+      border: 1px solid var(--red);
+      border-radius: var(--r-md);
+      padding: 24px;
+      text-align: center;
+      color: var(--red);
+    }
+
+    .error-state p {
+      font-size: 13px;
+      margin-top: 8px;
+      color: var(--text2);
+    }
+
+    /* ═══════════════════════════════════════
+       ENTRY ANIMATION (SNAPPY)
+    ═══════════════════════════════════════ */
+    .fade-in {
+      animation: fadeInUp 0.3s cubic-bezier(0.4, 0, 0.2, 1) both;
+    }
+
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* ── Scan Results Table ── */
+    .scan-wrap {
+      overflow-x: auto;
+      border-radius: var(--r-md);
+      border: 1px solid var(--border);
+      margin-bottom: 6px;
+    }
+
+    .scan-table {
+      width: 100%;
+      min-width: 920px;
+      border-collapse: collapse;
+      font-size: 12px;
+      background: var(--surface);
+    }
+
+    .scan-table th {
+      background: var(--bg);
+      color: var(--text2);
+      padding: 8px 10px;
+      font-weight: 700;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+
+    .scan-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      vertical-align: middle;
+    }
+
+    .scan-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .scan-table tr:hover td {
+      background: var(--surface2);
+    }
+
+    .decision-badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: var(--r-sm);
+      font-size: 10px;
+      font-weight: 800;
+      border: 1px solid;
+    }
+
+    .decision-buy {
+      background: var(--green-dim);
+      color: var(--green);
+      border-color: var(--green);
+    }
+
+    .decision-sell {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: var(--red);
+    }
+
+    .decision-hold {
+      background: var(--gold-dim);
+      color: var(--gold);
+      border-color: var(--gold);
+    }
+
+    .decision-other {
+      background: var(--surface3);
+      color: var(--text2);
+      border-color: var(--border2);
+    }
+
+    .scan-meta {
+      font-size: 10px;
+      color: var(--text3);
+      margin-bottom: 6px;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 0 4px;
+    }
+
+    .candidate-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .candidate-card {
+      border: 1px solid var(--border);
+      border-inline-start: 3px solid var(--cyan);
+      border-radius: var(--r-md);
+      background: var(--surface);
+      padding: 12px;
+      text-align: right;
+    }
+
+    .candidate-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+
+    .candidate-symbol {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 800;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    .candidate-status {
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .candidate-facts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 10px;
+      color: var(--text2);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .candidate-facts b {
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    .candidate-details {
+      margin-top: 10px;
+      border-top: 1px solid var(--border);
+      padding-top: 6px;
+    }
+
+    .candidate-details summary {
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+      color: var(--cyan);
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    .candidate-explanation {
+      display: grid;
+      gap: 8px;
+      color: var(--text2);
+      font-size: 13px;
+      line-height: 1.7;
+      padding-bottom: 4px;
+    }
+
+    .candidate-explanation strong {
+      color: var(--text);
+    }
+
+    .candidate-components {
+      display: grid;
+      gap: 5px;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      background: var(--surface2);
+      padding: 8px;
+    }
+
+    .candidate-component {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+      padding-bottom: 5px;
+      border-bottom: 1px dashed var(--border);
+    }
+
+    .candidate-component:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .candidate-component small {
+      display: block;
+      color: var(--text3);
+      margin-top: 2px;
+    }
+
+    .view-tabs {
+      position: sticky;
+      top: 56px;
+      z-index: 90;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+      padding: 6px 12px;
+      background: rgba(11, 14, 17, .96);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+
+    .view-tab {
+      min-height: 44px;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      background: var(--surface);
+      color: var(--text2);
+      font-family: 'Cairo', sans-serif;
+      font-weight: 700;
+      cursor: pointer;
+      transition: color var(--transition), background var(--transition), border-color var(--transition);
+    }
+
+    .view-tab[aria-selected="true"] {
+      color: #000;
+      background: var(--gold);
+      border-color: var(--gold);
+    }
+
+    .plans-cta {
+      width: 100%;
+      min-height: 52px;
+      margin-bottom: 10px;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border: 1px solid var(--cyan);
+      border-radius: var(--r-md);
+      background: var(--cyan-dim);
+      color: var(--text);
+      font-family: 'Cairo', sans-serif;
+      text-align: right;
+      cursor: pointer;
+    }
+
+    .plans-cta small {
+      display: block;
+      color: var(--text2);
+      margin-top: 2px;
+    }
+
+    .plans-page-head {
+      margin-bottom: 12px;
+      padding: 14px;
+      border: 1px solid var(--border2);
+      border-radius: var(--r-md);
+      background: var(--surface);
+    }
+
+    .plans-page-head h1 {
+      font-size: 17px;
+      margin-bottom: 5px;
+    }
+
+    .plans-page-head p {
+      color: var(--text2);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .plans-update-notice {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--gold);
+      border-radius: var(--r-md);
+      background: var(--gold-dim);
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .plans-update-notice.visible { display: flex; }
+
+    .plans-update-btn {
+      min-height: 44px;
+      padding: 8px 12px;
+      border: 0;
+      border-radius: var(--r-sm);
+      background: var(--gold);
+      color: #000;
+      font-family: 'Cairo', sans-serif;
+      font-weight: 800;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .plan-ticket {
+      border-inline-start-color: var(--gold);
+    }
+
+    .plan-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .plan-title-row > div { min-width: 0; }
+
+    .plan-symbol-btn {
+      min-height: 44px;
+      max-width: 100%;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      text-align: right;
+      text-decoration: underline dotted;
+      overflow-wrap: anywhere;
+    }
+
+    .plan-direction {
+      font-size: 15px;
+      font-weight: 900;
+    }
+
+    .plan-direction.long { color: var(--green); }
+    .plan-direction.short { color: var(--red); }
+    .plan-direction.watch { color: var(--gold); }
+
+    .plan-readiness {
+      padding: 4px 7px;
+      border: 1px solid var(--border2);
+      border-radius: var(--r-sm);
+      color: var(--text2);
+      font-size: 10px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .plan-readiness.ready {
+      color: var(--green);
+      border-color: var(--green);
+      background: var(--green-dim);
+    }
+
+    .plan-levels {
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      background: var(--surface2);
+    }
+
+    .plan-level {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: baseline;
+      min-height: 28px;
+    }
+
+    .plan-level span { color: var(--text2); }
+    .plan-level strong { color: var(--text); text-align: left; }
+    .plan-level.missing strong { color: var(--text3); font-family: 'Cairo', sans-serif; }
+
+    .plan-block {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      background: var(--surface);
+    }
+
+    .plan-block h2 {
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+
+    .plan-conditions {
+      padding-inline-start: 20px;
+      color: var(--text2);
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    .plan-block.cancel h2 { color: var(--red); }
+
+    .plan-notice {
+      margin-top: 10px;
+      color: var(--gold);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: .01ms !important;
+      }
+    }
+
+    @media (min-width: 760px) {
+      .candidate-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    /* ── TradingView Chart Modal ── */
+    .tv-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .85);
+      backdrop-filter: blur(4px);
+      z-index: 9999;
+      align-items: flex-start;
+      justify-content: center;
+      padding-top: 5vh;
+      padding-bottom: 20vh;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+    }
+
+    .tv-modal-overlay.open {
+      display: flex;
+      opacity: 1;
+    }
+
+    .tv-modal {
+      background: var(--surface);
+      border: 1px solid var(--border2);
+      border-radius: var(--r-lg);
+      width: min(96vw, 680px);
+      height: min(75vh, 480px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      animation: modalSlideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    @keyframes modalSlideIn {
+      from { opacity: 0; transform: translateY(20px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .tv-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .tv-modal-title {
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--gold);
+      letter-spacing: 0.5px;
+    }
+
+    .tv-close-btn {
+      background: none;
+      border: none;
+      color: var(--text2);
+      font-size: 20px;
+      cursor: pointer;
+      line-height: 1;
+      transition: color var(--transition), transform var(--transition);
+      width: 28px;
+      height: 28px;
+      border-radius: var(--r-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .tv-close-btn:hover {
+      color: var(--red);
+      transform: rotate(90deg);
+    }
+
+    .tv-frame {
+      flex: 1;
+      border: none;
+      width: 100%;
+    }
+
+    .clickable-symbol {
+      cursor: pointer;
+      text-decoration: underline dotted;
+      transition: color 0.1s ease;
+    }
+
+    .clickable-symbol:hover {
+      color: var(--gold);
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- ── HEADER ── -->
+  <div class="header">
+    <div class="header-left">
+      <img src="/static/icons/brain AI analysis.png" class="logo-img" alt="H">
+      <div>
+        <div class="header-name">حمزاوي || Trader</div>
+        <div class="header-sub">لوحة التداول الذكية</div>
+      </div>
+    </div>
+    <div class="live-pill">
+      <div class="live-dot"></div>
+      LIVE
+    </div>
+  </div>
+
+  <nav class="view-tabs" aria-label="أقسام لوحة التداول">
+    <button type="button" class="view-tab" id="dashboardViewTab" aria-selected="true"
+      aria-controls="app" onclick="showView('dashboard')">الرئيسية</button>
+    <button type="button" class="view-tab" id="plansViewTab" aria-selected="false"
+      aria-controls="watchPlansView" onclick="showView('plans')">
+      خطط المراقبة <span id="plansTabCount">—</span>
+    </button>
+  </nav>
+
+  <!-- ── CONTENT ── -->
+  <div class="content" id="app">
+    <div class="init-loader">
+      <div class="loader-ring"></div>
+      <div class="loader-text">جاري تحميل البيانات…</div>
+    </div>
+  </div>
+
+  <!-- هذا القسم ثابت خارج #app حتى لا تنهار البطاقات المفتوحة عند التحديث الدوري -->
+  <main class="content" id="watchPlansView" hidden>
+    <section class="plans-page-head">
+      <h1>خطط المراقبة المشروطة</h1>
+      <p>هذه ليست أوامر جاهزة. كل بطاقة تعرض ما حسبه البوت فعلاً، وما الذي يجب أن يتحقق قبل الدخول، ومتى تُلغى الفكرة.</p>
+    </section>
+    <div class="plans-update-notice" id="plansUpdateNotice" role="status" aria-live="polite">
+      <span>وصل مسح أحدث. بقيت الصفحة الحالية ثابتة حتى لا تفقد موضع القراءة.</span>
+      <button type="button" class="plans-update-btn" onclick="applyPendingPlanUpdate()">عرض الجديد</button>
+    </div>
+    <div class="candidate-grid" id="watchPlansContent">
+      <div class="init-loader">
+        <div class="loader-ring"></div>
+        <div class="loader-text">جاري تحميل الخطط…</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── BOTTOM BAR ── -->
+  <div class="bottom-bar">
+    <div class="last-update">
+      <strong id="lastUpdateVal">—</strong>
+      آخر تحديث
+    </div>
+      <button class="refresh-btn" id="refreshBtn" onclick="manualRefresh()">
+        <span class="refresh-icon"><img src="/static/icons/refresh%20restart.png" alt="" style="width:14px;height:14px;vertical-align:middle;" onerror="this.parentElement.textContent='🔄'"></span>
+        <span id="refreshBtnLabel">تحديث</span>
+      </button>
+  </div>
+
+  <!-- ── TradingView Modal ── -->
+  <div class="tv-modal-overlay" id="tvOverlay" onclick="closeTvChart(event)">
+    <div class="tv-modal">
+      <div class="tv-modal-head">
+        <div class="tv-modal-title" id="tvTitle">شارت —</div>
+        <button class="tv-close-btn" onclick="closeTvModal()">✕</button>
+      </div>
+      <iframe class="tv-frame" id="tvFrame" src="" allowtransparency="true"></iframe>
+    </div>
+  </div>
+
+  <script>
+    /* ─── Telegram Init ─── */
+    const tg = window.Telegram?.WebApp;
+    if (tg) { tg.ready(); tg.expand(); }
+
+    /* ─── إرسال initData مع كل طلب API لمصادقة Telegram ─── */
+    const _tgInitData = tg?.initData || '';
+    async function _apiFetch(url) {
+      return fetch(url, {
+        headers: _tgInitData ? { 'X-Telegram-Init-Data': _tgInitData } : {}
+      });
+    }
+
+    /* ─── TradingView Chart ─── */
+    function openTvChart(symbol) {
+      // نحوّل "BTC/USDT" أو "BTCUSDT" إلى "BINANCE:BTCUSDT.P" للتحليل الآجل
+      const clean = symbol.replace('/', '').replace(':USDT', '').toUpperCase();
+      // بما أن البوت آجل (Futures)، نستخدم رمز العقود المستمرة (.P) لضمان العمل على جميع أزواج باينانس الآجلة (بما فيها LABUSDT)
+      const tvSym = `BINANCE:${clean}.P`;
+      document.getElementById('tvTitle').textContent = `شارت — ${symbol}`;
+      document.getElementById('tvFrame').src =
+        `https://www.tradingview.com/widgetembed/?symbol=${tvSym}&interval=15&theme=dark&style=1&locale=ar&toolbar_bg=%23080b10&hide_side_toolbar=1&allow_symbol_change=0&save_image=0`;
+      document.getElementById('tvOverlay').classList.add('open');
+    }
+
+    function closeTvModal() {
+      document.getElementById('tvOverlay').classList.remove('open');
+      document.getElementById('tvFrame').src = '';
+    }
+
+    function closeTvChart(e) {
+      if (e.target === document.getElementById('tvOverlay')) closeTvModal();
+    }
+
+    let chart = null;
+
+    /* ─── Formatters ─── */
+    const fmtN = (v, d = 4) => (typeof v === 'number' ? v.toFixed(d) : '0');
+    const fmtPnl = v => {
+      const n = parseFloat(v);
+      return (n >= 0 ? '+' : '') + n.toFixed(4);
+    };
+    const fmtPct = v => {
+      const n = parseFloat(v);
+      return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+    };
+    const escapeHtml = value => String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+    const numberOrDash = (value, digits = 2) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(digits) : '—';
+    };
+    const formatPrice = value => {
+      const number = Number(value);
+      if (!Number.isFinite(number) || number <= 0) return 'لم يُحسب بعد';
+      const digits = Math.abs(number) < 1 ? 8 : (Math.abs(number) < 100 ? 4 : 2);
+      return number.toFixed(digits).replace(/\.?0+$/, '');
+    };
+    const stageLabel = value => ({
+      TECHNICAL_SIGNAL: 'الإشارة الفنية',
+      ENTRY_QUALITY: 'جودة الدخول',
+      TRADE_GEOMETRY: 'العائد والمخاطرة',
+      ENTRY_TRIGGER: 'تأكيد الدخول',
+      EXECUTION: 'التنفيذ',
+    }[value] || value || '—');
+
+    let activeView = sessionStorage.getItem('dashboardActiveView') === 'plans' ? 'plans' : 'dashboard';
+    let latestScanSnapshot = null;
+    let pendingPlansSnapshot = null;
+    let renderedPlansScanTime = null;
+    const viewScrollPositions = { dashboard: 0, plans: 0 };
+
+    function showView(view) {
+      const nextView = view === 'plans' ? 'plans' : 'dashboard';
+      if (nextView !== activeView) viewScrollPositions[activeView] = window.scrollY;
+      activeView = nextView;
+      sessionStorage.setItem('dashboardActiveView', activeView);
+      const dashboard = document.getElementById('app');
+      const plans = document.getElementById('watchPlansView');
+      const dashboardTab = document.getElementById('dashboardViewTab');
+      const plansTab = document.getElementById('plansViewTab');
+      dashboard.hidden = activeView !== 'dashboard';
+      plans.hidden = activeView !== 'plans';
+      dashboardTab.setAttribute('aria-selected', String(activeView === 'dashboard'));
+      plansTab.setAttribute('aria-selected', String(activeView === 'plans'));
+      document.getElementById('refreshBtnLabel').textContent = activeView === 'plans' ? 'تحديث الخطط' : 'تحديث';
+
+      if (activeView === 'plans' && latestScanSnapshot && !renderedPlansScanTime) {
+        renderWatchPlans(latestScanSnapshot);
+      }
+      requestAnimationFrame(() => window.scrollTo({ top: viewScrollPositions[activeView], behavior: 'auto' }));
+    }
+
+    async function manualRefresh() {
+      if (activeView === 'plans') {
+        await loadScanResults({ forcePlansRender: true, showLoading: true });
+      } else {
+        await loadDashboard({ showLoading: true });
+      }
+    }
+
+    function applyPendingPlanUpdate() {
+      if (pendingPlansSnapshot) renderWatchPlans(pendingPlansSnapshot);
+    }
+
+    /* ─── Load ─── */
+    async function loadDashboard({ showLoading = true } = {}) {
+      const btn = document.getElementById('refreshBtn');
+      if (showLoading) {
+        btn.classList.add('loading');
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', 'true');
+      }
+      try {
+        const res = await _apiFetch('/api/dashboard');
+        if (res.status === 403) {
+          document.getElementById('app').innerHTML = `
+          <div class="error-state fade-in" style="background: rgba(245,158,11,.07); border-color: rgba(245,158,11,.2); color: var(--gold);">
+            <div style="font-size:32px">🔒</div>
+            <p style="font-weight:bold; margin-top:10px; font-size:15px;">عذراً، غير مصرح بالدخول مباشرة</p>
+            <p style="font-size:12px; color:var(--text3); margin-top:4px; line-height:1.5; direction:rtl; text-align:center;">يرجى فتح لوحة التحكم من داخل تطبيق تيليجرام (أو البوت الخاص بك) لحماية خصوصية بيانات التداول الخاصة بك.</p>
+          </div>`;
+          return;
+        }
+        if (!res.ok) throw new Error('Network response was not ok');
+        const data = await res.json();
+        renderDashboard(data);
+        document.getElementById('lastUpdateVal').textContent = data.updated_at || '—';
+      } catch (e) {
+        document.getElementById('app').innerHTML = `
+        <div class="error-state fade-in">
+          <div style="font-size:26px">⚠️</div>
+          <p>تعذّر تحميل البيانات، تحقق من الاتصال</p>
+        </div>`;
+      } finally {
+        if (showLoading) {
+          btn.classList.remove('loading');
+          btn.disabled = false;
+          btn.removeAttribute('aria-busy');
+        }
+      }
+    }
+
+    /* ─── Render ─── */
+    function renderDashboard(data) {
+      const s = data.stats || {};
+      const w = data.wallet || {};
+
+      const totalPnl = parseFloat(s.total_pnl || 0);
+      const winRate = parseFloat(s.win_rate || 0);
+      const pf = parseFloat(s.profit_factor || 0);
+      const walletBal = parseFloat(w.wallet_balance || 0);
+      const available = parseFloat(w.available || 0);
+      const usedMargin = parseFloat(w.used_margin || 0);
+      const upnl = parseFloat(w.unrealized_pnl || 0);
+      const realPnl = parseFloat(s.total_pnl || 0);
+      const totalRet = parseFloat(s.win_rate || 0);
+
+      /* colour helpers */
+      const gc = v => v >= 0 ? 'col-g' : 'col-r';
+      const pfC = v => v >= 1.5 ? 'g' : (v >= 1 ? 'y' : 'r');
+      const pfCV = v => v >= 1.5 ? 'col-g' : (v >= 1 ? 'col-y' : 'col-r');
+
+      /* ── KPI grid ── */
+      let html = `<div class="kpi-grid fade-in">
+      <div class="kpi v">
+        <div class="kpi-label">الصفقات المغلقة</div>
+        <div class="kpi-value col-v">${s.total || 0}</div>
+        <div class="kpi-sub">
+          <span class="pos">✅ ${s.wins || 0}</span>
+          &nbsp;
+          <span class="neg">❌ ${s.losses || 0}</span>
+        </div>
+      </div>
+      <div class="kpi ${winRate >= 50 ? 'g' : 'r'}">
+        <div class="kpi-label">دقة الاستراتيجية (Win Rate)</div>
+        <div class="kpi-value ${winRate >= 50 ? 'col-g' : 'col-r'}">${winRate}%</div>
+        <div class="kpi-sub">الهدف › 50%</div>
+      </div>
+      <div class="kpi ${totalPnl >= 0 ? 'g' : 'r'}">
+        <div class="kpi-label">الربح الصافي (Net)</div>
+        <div class="kpi-value ${gc(totalPnl)}">${fmtPnl(totalPnl)}</div>
+        <div class="kpi-sub">USDT</div>
+      </div>
+      <div class="kpi ${pfC(pf)}">
+        <div class="kpi-label">Profit Factor</div>
+        <div class="kpi-value ${pfCV(pf)}">${pf >= 999 ? '∞' : pf}</div>
+        <div class="kpi-sub">الهدف › 1.5</div>
+      </div>
+    </div>`;
+
+      /* ── Wallet hero ── */
+      html += `
+    <div class="wallet-hero fade-in" style="animation-delay:.05s">
+      <div class="wallet-title"><img src="/static/icons/wallet%20money.png" alt="" style="width:14px;height:14px;vertical-align:middle;margin-left:4px;" onerror="this.style.display='none'">محفظة Binance (Live)</div>
+      <div class="balance-display">
+        <div class="balance-amount">${walletBal.toFixed(2)}</div>
+        <div class="balance-unit">USDT</div>
+      </div>
+      <div class="wallet-rows">
+        <div class="wallet-stat">
+          <div class="wallet-stat-label">المتاح (Available)</div>
+          <div class="wallet-stat-val col-g">${available.toFixed(2)} USDT</div>
+        </div>
+        <div class="wallet-stat">
+          <div class="wallet-stat-label">المستخدم (Used)</div>
+          <div class="wallet-stat-val col-y">${usedMargin.toFixed(2)} USDT</div>
+        </div>
+        <div class="wallet-stat">
+          <div class="wallet-stat-label">Unrealized PNL</div>
+          <div class="wallet-stat-val ${gc(upnl)}">${fmtPnl(upnl)}</div>
+        </div>
+        <div class="wallet-stat">
+          <div class="wallet-stat-label">Realized PNL (البوت)</div>
+          <div class="wallet-stat-val ${gc(realPnl)}">${fmtPnl(realPnl)}</div>
+        </div>
+      </div>
+    </div>`;
+
+      /* ── Chart ── */
+      html += `
+    <div class="section-head fade-in" style="animation-delay:.1s">
+      <div class="icon"><img src="/static/icons/percentage%20chart.png" alt="" onerror="this.parentElement.textContent='📈'"></div>
+      <div class="label">منحنى الربح</div>
+      <div class="count-badge" id="chartCountBadge">المنحنى الكامل</div>
+    </div>
+    <div class="chart-card fade-in" style="animation-delay:.12s">
+      <div class="chart-scroll-container" style="width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; direction: ltr;">
+        <div id="chartWrapper" style="height: 150px; min-width: 100%;">
+          <canvas id="pnlChart"></canvas>
+        </div>
+      </div>
+    </div>`;
+
+      /* ── Open Positions ── */
+      const ops = data.open_positions || [];
+      html += `
+    <div class="section-head fade-in" style="animation-delay:.14s">
+      <div class="icon"><img src="/static/icons/lightning%20bolt.png" alt="" onerror="this.parentElement.textContent='⚡'"></div>
+      <div class="label">مفتوحة</div>
+      <div class="count-badge">${ops.length}</div>
+    </div>`;
+
+      if (ops.length === 0) {
+        html += `<div class="empty fade-in" style="animation-delay:.16s">
+        <span class="empty-icon">😴</span>
+        <div class="empty-text">لا توجد صفقات مفتوحة الآن</div>
+      </div>`;
+      } else {
+        ops.forEach((p, i) => {
+          const isLong = p.side === 'BUY' || p.side === 'LONG';
+          html += `
+        <div class="pos-card fade-in" style="animation-delay:${.16 + i * .04}s; display:block; padding:10px;">
+          <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
+            <div class="pos-dir ${isLong ? 'long' : 'short'}">${isLong ? 'LONG' : 'SHORT'}</div>
+            <div class="pos-body">
+              <div class="pos-pair">
+                <span class="clickable-symbol" onclick="openTvChart('${p.symbol}')">${p.symbol.split(':')[0]}</span>
+                <span style="font-size:10px; color:var(--text3); font-weight:normal;">${p.leverage}x</span>
+              </div>
+              <div class="pos-meta">
+                <span style="color:var(--text2)">كمية: ${p.contracts}</span>
+                <span style="color:var(--text2)">هامش: ${p.margin_used} USDT</span>
+              </div>
+            </div>
+            <div class="pos-right">
+              <div class="pos-pnl ${gc(p.unrealized_pnl)}">${fmtPnl(p.unrealized_pnl)}</div>
+              <div class="pos-time ${gc(p.roe_pct)}" style="font-weight:bold; font-size:11px;">${p.roe_pct >= 0 ? '+' : ''}${p.roe_pct}% ROE</div>
+            </div>
+          </div>
+          <div class="pos-meta" style="background:var(--surface2); padding:8px 10px; border-radius:6px; justify-content:space-between; border: 1px solid var(--border);">
+             <span>سعر الدخول: <strong style="color:var(--text1);">${parseFloat(p.entry_price).toFixed(4)}</strong></span>
+             <span>السوق: <strong style="color:var(--text1);">${parseFloat(p.mark_price).toFixed(4)}</strong></span>
+          </div>
+          ${(() => {
+            const slInit = parseFloat(p.sl || 0);
+            const slCurr = parseFloat(p.current_sl || 0);
+            const slMoved = slCurr > 0 && Math.abs(slCurr - slInit) > 0.000001;
+            return `
+          <div class="pos-meta" style="background:var(--surface2); padding:8px 10px; border-radius:6px; justify-content:space-between; border: 1px solid ${slMoved ? 'var(--gold)' : 'var(--border)'}; margin-top:4px; flex-direction:column; gap:5px; ${slMoved ? 'box-shadow:0 0 10px rgba(240, 185, 11, 0.15);' : ''}">
+             <div style="display:flex; justify-content:space-between;">
+               ${p.sl ? `<span class="sl" style="${slMoved ? 'text-decoration:line-through; opacity:0.5;' : ''}"><img src="/static/icons/stop%20sign%20emergency.png" alt="" style="width:11px;height:11px;vertical-align:middle;margin-left:2px;" onerror="this.style.display='none'">SL الأصلي: <strong>${slInit.toFixed(5)}</strong></span>` : '<span class="sl" style="opacity:0.5">SL: غير محدد</span>'}
+               ${p.tp ? `<span class="tp">🎯 TP: <strong>${parseFloat(p.tp).toFixed(5)}</strong></span>` : '<span class="tp" style="opacity:0.5">TP: غير محدد</span>'}
+             </div>
+             ${slMoved ? `<div style="display:flex; align-items:center; gap:4px; color:var(--gold); font-size:10px; animation: pulse-gold 1.5s ease-in-out infinite;">
+               <img src="/static/icons/shield%20protection.png" alt="" style="width:12px;height:12px;" onerror="this.style.display='none'">
+               SL انتقل لصالحك 🚀 الآن عند: <strong style="font-family:'JetBrains Mono',monospace;">${slCurr.toFixed(5)}</strong>
+             </div>` : ''}
+          </div>`;
+          })()}
+        </div>`;
+        });
+      }
+
+      /* ── Trades History ── */
+      const trades = (data.trades || []).slice(0, 20);
+      html += `
+    <div class="section-head fade-in" style="animation-delay:.2s">
+      <div class="icon"><img src="/static/icons/report%20document.png" alt="" onerror="this.parentElement.textContent='📋'"></div>
+      <div class="label">آخر الصفقات</div>
+    </div>
+    <div class="trades-wrap fade-in" style="animation-delay:.22s">
+      <table class="trades-table">
+        <thead>
+          <tr>
+            <th>الزوج</th>
+            <th>الاتجاه</th>
+            <th>الدخول</th>
+            <th>PNL</th>
+            <th>ROE</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+      if (trades.length === 0) {
+        html += `<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px">لا توجد صفقات مغلقة</td></tr>`;
+      } else {
+        trades.forEach(t => {
+          const isLong = t.side === 'BUY' || t.side === 'LONG';
+          const pnlPos = t.pnl >= 0;
+          const roePos = parseFloat(t.roe_pct) >= 0;
+          html += `
+          <tr>
+            <td>
+              <div class="trade-pair">
+                ${pnlPos ? '✅' : '❌'}
+                <span class="clickable-symbol" onclick="openTvChart('${t.symbol}')">${t.symbol.split('/')[0]}</span>
+              </div>
+              <div class="trade-time">${t.exit_time}</div>
+            </td>
+            <td><span class="dir-tag ${isLong ? 'long' : 'short'}">${isLong ? 'LONG' : 'SHORT'}</span></td>
+            <td class="td-entry">${parseFloat(t.entry_price).toFixed(4)}</td>
+            <td class="td-pnl ${pnlPos ? 'col-g' : 'col-r'}">${fmtPnl(t.pnl)}</td>
+            <td class="td-roe ${roePos ? 'col-g' : 'col-r'}">
+              ${roePos ? '+' : ''}${parseFloat(t.roe_pct).toFixed(1)}%
+            </td>
+          </tr>`;
+        });
+      }
+
+      html += `</tbody></table></div>`;
+
+      /* ── Scan Results ── */
+      html += `
+    <div class="section-head fade-in" style="animation-delay:.28s">
+      <div class="icon"><img src="/static/icons/brain%20AI%20analysis.png" alt="" onerror="this.parentElement.textContent='🔍'"></div>
+      <div class="label">آخر مسح للسوق</div>
+      <div class="count-badge" id="scanBadge">—</div>
+    </div>
+    <div id="scanSection" class="fade-in" style="animation-delay:.30s">
+      <div class="scan-meta" id="scanMeta">جاري التحميل...</div>
+      <button type="button" class="plans-cta" onclick="showView('plans')" aria-controls="watchPlansView">
+        <span><strong>فتح خطط المراقبة المشروطة</strong><small>دخول وأهداف ووقف وشروط تفعيل/إلغاء بصياغة عملية</small></span>
+        <b id="dashboardPlansCount">—</b>
+      </button>
+      <div class="scan-wrap">
+        <table class="scan-table">
+          <thead><tr><th>العملة</th><th>القرار</th><th>حالة المرشح</th><th>التقدم</th><th>السعر</th><th>RSI</th><th>السبب / المطلوب تالياً</th></tr></thead>
+          <tbody id="scanBody"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:16px">جاري تحميل نتائج المسح...</td></tr></tbody>
+        </table>
+      </div>
+    </div>`;
+
+      document.getElementById('app').innerHTML = html;
+
+      /* load scan separately so it doesn't block main render */
+      loadScanResults();
+
+      /* ── Chart.js ── */
+      const ctx = document.getElementById('pnlChart');
+      if (ctx && data.chart && data.chart.labels?.length > 0) {
+        if (chart) chart.destroy();
+
+        const totalPoints = data.chart.labels.length;
+        const wrapper = document.getElementById('chartWrapper');
+        if (wrapper) {
+          // 20px per trade, at least 100% of parent width
+          const containerWidth = wrapper.parentElement.clientWidth || 350;
+          const dynamicWidth = Math.max(containerWidth, totalPoints * 20);
+          wrapper.style.width = dynamicWidth + 'px';
+        }
+
+        // Update count badge
+        const badge = document.getElementById('chartCountBadge');
+        if (badge && data.trades) {
+          badge.textContent = `${data.trades.length} صفقة`;
+        }
+
+        const positiveColor = 'rgba(14, 203, 129,.8)';
+        const negativeColor = 'rgba(246, 70, 93,.8)';
+
+        chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: data.chart.labels,
+            datasets: [{
+              label: 'PNL تراكمي',
+              data: data.chart.cumulative,
+              fill: true,
+              backgroundColor: ctx => {
+                const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 150);
+                g.addColorStop(0, 'rgba(240, 185, 11,.2)');
+                g.addColorStop(1, 'rgba(240, 185, 11,.0)');
+                return g;
+              },
+              borderColor: '#F0B90B', // لون ذهبي للمنحنى
+              borderWidth: 2,
+              pointRadius: 3,
+              pointBackgroundColor: data.chart.bar_colors || '#F0B90B',
+              pointBorderWidth: 0,
+              tension: 0.3, // زوايا أكثر حدة للمنحنى
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                backgroundColor: '#181B22',
+                borderColor: '#2B2F36',
+                borderWidth: 1,
+                titleColor: '#848E9C',
+                bodyColor: '#EAECEF',
+                titleFont: { family: 'Cairo', size: 10, weight: 'bold' },
+                bodyFont: { family: 'JetBrains Mono', size: 12 },
+                callbacks: {
+                  label: ctx => ' ' + (ctx.parsed.y >= 0 ? '+' : '') + ctx.parsed.y.toFixed(4) + ' USDT'
+                }
+              }
+            },
+            scales: {
+              x: {
+                ticks: {
+                  color: '#5E6673',
+                  font: { size: 9, family: 'Cairo' },
+                  maxRotation: 0,
+                  autoSkip: true,
+                  maxTicksLimit: Math.max(8, Math.floor(totalPoints / 3))
+                },
+                grid: { color: 'rgba(255,255,255,.03)' },
+                border: { color: '#2B2F36' },
+              },
+              y: {
+                ticks: {
+                  color: '#5E6673',
+                  font: { size: 9, family: 'JetBrains Mono' },
+                },
+                grid: { color: 'rgba(255,255,255,.03)' },
+                border: { color: '#2B2F36' },
+              },
+            },
+          },
+        });
+
+        // Scroll to end of performance (most recent trades are on the right)
+        if (wrapper) {
+          setTimeout(() => {
+            const container = wrapper.parentElement;
+            container.scrollLeft = container.scrollWidth;
+          }, 80);
+        }
+      }
+    }
+
+    function renderWatchPlans(scan) {
+      const root = document.getElementById('watchPlansContent');
+      if (!root || !scan || !scan.results) return;
+
+      const rows = [...scan.results].sort((a, b) => {
+        const ar = Number(a.candidate_assessment?.candidate_rank || 9999);
+        const br = Number(b.candidate_assessment?.candidate_rank || 9999);
+        return ar - br;
+      });
+      const candidates = rows.filter(row => {
+        const candidate = row.candidate_assessment || {};
+        return candidate.is_candidate && !['IGNORED', 'IN_POSITION', 'EXECUTED'].includes(candidate.status);
+      });
+
+      root.innerHTML = candidates.length ? candidates.map(row => {
+        const candidate = row.candidate_assessment || {};
+        const plan = candidate.conditional_plan || {};
+        const direction = String(plan.direction || candidate.side || candidate.bias || '').toUpperCase();
+        const directionClass = direction === 'BUY' ? 'long' : (direction === 'SELL' ? 'short' : 'watch');
+        const entryZone = plan.entry_zone || {};
+        const entryText = Number.isFinite(Number(entryZone.low)) && Number.isFinite(Number(entryZone.high))
+          ? `${formatPrice(entryZone.low)} — ${formatPrice(entryZone.high)}`
+          : formatPrice(plan.entry);
+        const stopSuffix = plan.stop_kind === 'STRUCTURAL_INVALIDATION'
+          ? ' (إبطال هيكلي؛ الوقف النهائي لم يُحسب)'
+          : '';
+        const targets = Array.isArray(plan.targets) ? plan.targets.slice(0, 3) : [];
+        const targetRows = [0, 1, 2].map(index => {
+          const target = targets[index];
+          return `<div class="plan-level ${target ? '' : 'missing'}">
+            <span>الهدف ${index + 1}</span>
+            <strong class="mono">${target ? escapeHtml(formatPrice(target.price)) : 'لم يُحسب بعد'}</strong>
+          </div>`;
+        }).join('');
+        const activation = (plan.activation_conditions || []).map(condition =>
+          `<li>${escapeHtml(condition.text_ar || '')}</li>`
+        ).join('');
+        const cancellation = (plan.cancellation_conditions || []).map(condition => {
+          const level = Number.isFinite(Number(condition.level))
+            ? ` <strong class="mono">${escapeHtml(formatPrice(condition.level))}</strong>`
+            : '';
+          return `<li>${escapeHtml(condition.text_ar || '')}${level}</li>`;
+        }).join('');
+        const passed = (candidate.passed_stages || []).map(stageLabel).join(' ← ') || 'لم يجتز مرحلة بعد';
+        const readiness = plan.trade_allowed_by_pipeline ? 'جاهزة للمراجعة التنفيذية' : 'غير جاهزة للتنفيذ';
+        const sourceText = targets[0]?.source ? ` — المصدر: ${targets[0].source}` : '';
+
+        return `<article class="candidate-card plan-ticket">
+          <div class="plan-title-row">
+            <div>
+              <button type="button" class="candidate-symbol plan-symbol-btn" onclick="openTvChart('${escapeHtml(candidate.symbol || row.coin || '')}')" aria-label="فتح شارت ${escapeHtml(candidate.symbol || row.coin || '')}">${escapeHtml(candidate.symbol || row.coin || '—')}</button>
+              <div class="plan-direction ${directionClass}">${escapeHtml(plan.direction_label_ar || 'الاتجاه لم يُحسم')}</div>
+            </div>
+            <span class="plan-readiness ${plan.trade_allowed_by_pipeline ? 'ready' : ''}">${readiness}</span>
+          </div>
+
+          <div class="plan-levels" aria-label="مستويات الخطة">
+            <div class="plan-level ${plan.entry ? '' : 'missing'}">
+              <span>منطقة الدخول</span><strong class="mono">${escapeHtml(entryText)}</strong>
+            </div>
+            ${targetRows}
+            <div class="plan-level ${plan.stop ? '' : 'missing'}">
+              <span>وقف الخسارة / الإبطال</span>
+              <strong class="mono">${escapeHtml(formatPrice(plan.stop))}${escapeHtml(stopSuffix)}</strong>
+            </div>
+          </div>
+
+          <section class="plan-block">
+            <h2>لا تُفعّل الخطة إلا بعد تحقق الآتي</h2>
+            <ol class="plan-conditions">${activation || '<li>لم تُسجل شروط تفعيل.</li>'}</ol>
+          </section>
+          <section class="plan-block cancel">
+            <h2>تُلغى الفكرة فوراً إذا</h2>
+            <ul class="plan-conditions">${cancellation || '<li>تغيّرت البنية قبل الدخول.</li>'}</ul>
+          </section>
+          <div class="plan-notice">${escapeHtml(plan.notice_ar || 'خطة متابعة وليست أمراً.')}${escapeHtml(sourceText)}</div>
+
+          <details class="candidate-details">
+            <summary>لماذا ينتظر البوت؟</summary>
+            <div class="candidate-explanation">
+              <div><strong>الحالة:</strong> ${escapeHtml(candidate.status_label_ar || candidate.status || '—')}</div>
+              <div><strong>المطلوب الآن:</strong> ${escapeHtml(candidate.next_trigger || 'غير متاح')}</div>
+              <div><strong>السبب:</strong> ${escapeHtml(candidate.reason || row.reason || 'غير متاح')}</div>
+              <div><strong>ما اجتازه:</strong> ${escapeHtml(passed)}</div>
+              <div><strong>المرحلة التالية:</strong> ${escapeHtml(stageLabel(candidate.waiting_stage))}</div>
+              <div><strong>درجة الأدلة:</strong> ${candidate.candidate_score == null ? 'غير محسوبة' : `${numberOrDash(candidate.candidate_score, 0)}/100`} — ليست احتمال ربح.</div>
+              <div><strong>الخلاصة الفنية:</strong> ${escapeHtml(candidate.analysis_summary_ar || 'غير متاحة')}</div>
+            </div>
+          </details>
+        </article>`;
+      }).join('') : '<div class="empty"><div class="empty-text">لا توجد خطط مراقبة نشطة في هذه الجولة.</div></div>';
+
+      renderedPlansScanTime = String(scan.scan_time || '');
+      pendingPlansSnapshot = null;
+      document.getElementById('plansUpdateNotice')?.classList.remove('visible');
+    }
+
+    /* ─── Scan Results Loader ─── */
+    async function loadScanResults({ forcePlansRender = false, showLoading = false } = {}) {
+      const refreshButton = document.getElementById('refreshBtn');
+      if (showLoading) {
+        refreshButton.classList.add('loading');
+        refreshButton.disabled = true;
+        refreshButton.setAttribute('aria-busy', 'true');
+      }
+      try {
+        const res = await _apiFetch('/api/latest_scan');
+        const scan = await res.json();
+        if (!scan || !scan.results) return;
+        latestScanSnapshot = scan;
+
+        const badge = document.getElementById('scanBadge');
+        const meta = document.getElementById('scanMeta');
+        const tbody = document.getElementById('scanBody');
+
+        if (badge) badge.textContent = scan.total_scanned || 0;
+        if (meta) {
+          const metrics = scan.candidate_metrics || {};
+          const average = metrics.average_candidate_score == null ? '—' : Number(metrics.average_candidate_score).toFixed(0);
+          const coverage = metrics.average_evidence_coverage_pct == null ? '—' : Number(metrics.average_evidence_coverage_pct).toFixed(0);
+          meta.textContent = `آخر مسح: ${scan.scan_time || '—'} | فُحص: ${scan.total_scanned || 0} | مرشحون: ${scan.candidate_count || 0} | متوسط الأدلة: ${average}/100 | اكتمال: ${coverage}% | Veto أمان: ${metrics.hard_safety_veto_count || 0}`;
+        }
+
+        const decisionClass = d => {
+          if (d.includes('BUY') || d.includes('شراء')) return 'decision-buy';
+          if (d.includes('SELL') || d.includes('بيع')) return 'decision-sell';
+          if (d.includes('HOLD') || d.includes('ACTIVE')) return 'decision-hold';
+          return 'decision-other';
+        };
+
+        const esc = escapeHtml;
+
+        const rows = [...scan.results].sort((a, b) => {
+          const ar = Number(a.candidate_assessment?.candidate_rank || 9999);
+          const br = Number(b.candidate_assessment?.candidate_rank || 9999);
+          return ar - br;
+        });
+
+        const candidates = rows.filter(r => {
+          const c = r.candidate_assessment || {};
+          return c.is_candidate && !['IGNORED', 'IN_POSITION', 'EXECUTED'].includes(c.status);
+        });
+        document.getElementById('plansTabCount').textContent = candidates.length;
+        const dashboardCount = document.getElementById('dashboardPlansCount');
+        if (dashboardCount) dashboardCount.textContent = candidates.length;
+
+        const scanTime = String(scan.scan_time || '');
+        if (forcePlansRender || !renderedPlansScanTime || activeView !== 'plans') {
+          renderWatchPlans(scan);
+        } else if (scanTime !== renderedPlansScanTime) {
+          pendingPlansSnapshot = scan;
+          document.getElementById('plansUpdateNotice')?.classList.add('visible');
+        }
+
+        if (tbody) tbody.innerHTML = rows.map(r => {
+          const candidate = r.candidate_assessment || {};
+          const progress = candidate.pipeline_progress_pct;
+          const state = candidate.status_label_ar || '—';
+          const next = candidate.next_trigger || '';
+          const reason = r.reason || '—';
+          return `
+        <tr>
+          <td><strong>${esc(r.coin || '—')}</strong></td>
+          <td><span class="decision-badge ${decisionClass(String(r.decision || ''))}">${esc(r.decision || '—')}</span></td>
+          <td style="direction:rtl;text-align:right">${esc(state)}</td>
+          <td class="mono" title="تقدم داخل مراحل القرار، وليس احتمال ربح">${progress == null ? '—' : `${Number(progress).toFixed(0)}%`}</td>
+          <td class="mono">${parseFloat(r.price || 0).toFixed(4)}</td>
+          <td class="mono" style="color:${parseFloat(r.rsi || 0) > 70 ? 'var(--red)' : parseFloat(r.rsi || 0) < 30 ? 'var(--cyan)' : 'var(--text2)'}">
+            ${parseFloat(r.rsi || 0).toFixed(1)}
+          </td>
+          <td style="color:var(--text2); font-size:11px; max-width:280px; white-space:normal; line-height:1.4; direction:rtl; text-align:right;" title="${esc(reason)}">
+            ${esc(reason)}${next ? `<br><span style="color:var(--cyan)">التالي: ${esc(next)}</span>` : ''}
+          </td>
+        </tr>`;
+        }).join('');
+      } catch (e) {
+        const tbody = document.getElementById('scanBody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:16px">تعذّر تحميل نتائج المسح</td></tr>`;
+      } finally {
+        if (showLoading) {
+          refreshButton.classList.remove('loading');
+          refreshButton.disabled = false;
+          refreshButton.removeAttribute('aria-busy');
+        }
+      }
+    }
+
+    /* ─── Boot ─── */
+    showView(activeView);
+    loadDashboard({ showLoading: true });
+    setInterval(() => loadDashboard({ showLoading: false }), 30_000);
+  </script>
+</body>
+
+</html>

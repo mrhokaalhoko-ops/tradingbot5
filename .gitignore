@@ -1,0 +1,54 @@
+# Secrets
+.env
+.env.*
+!.env.example
+/telegram_bot.py
+
+# Runtime state
+bot_state.json
+bot_state.json.*
+trade_journal/
+*.tmp
+*.bak
+
+# Logs
+logs/
+*.log
+logs.*.log
+logs.*.json
+logs.*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Data / reports
+testnet_trades_log.csv
+research_data/
+/scratch/
+/reports/
+/runtime/
+/artifacts/
+/deliverables/
+/audit_exports/
+/tmp/
+node_modules/
+*.csv
+*.sqlite
+*.db
+*.db-*
+
+# Candle reports and trade data (local analysis files)
+candles_report*/
+candles_report_*/
+*.zip
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
