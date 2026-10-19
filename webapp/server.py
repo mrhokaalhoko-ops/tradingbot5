@@ -117,6 +117,33 @@ def init_webapp(state_manager=None, client=None):
     _state_manager = state_manager
     _client = client
 
+
+def _effective_runtime_config() -> dict:
+    """Expose the effective risk configuration without secrets or guessed values."""
+    effective_risk = float(Config.RISK_PER_TRADE_PERCENT)
+    if _state_manager is not None:
+        try:
+            effective_risk = float(_state_manager.get_risk_pct())
+        except Exception:
+            pass
+    return {
+        "entry_margin_percent": float(Config.ENTRY_MARGIN_PERCENT),
+        "base_stop_risk_percent": effective_risk,
+        "hard_risk_cap_percent": float(Config.HARD_MAX_RISK_PER_TRADE_PERCENT),
+        "leverage": int(getattr(Config, "LEVERAGE", 1)),
+        "max_open_trades": int(getattr(Config, "MAX_OPEN_TRADES", 0)),
+        "structural_stop_v2_enabled": bool(
+            getattr(Config, "STRUCTURAL_STOP_V2_ENABLED", False)
+        ),
+        "trade_management_v2_enabled": bool(
+            getattr(Config, "TRADE_MANAGEMENT_V2_ENABLED", False)
+        ),
+        "trade_management_v2_activation_r": float(
+            getattr(Config, "TRADE_MANAGEMENT_V2_ACTIVATION_R", 1.5)
+        ),
+        "source": "effective_runtime_config",
+    }
+
 # ------------------------------------------------------------------
 # Live Binance API helpers (بيانات حقيقية من باينانس مباشرة)
 # ------------------------------------------------------------------
@@ -198,9 +225,34 @@ def _get_live_positions() -> list:
             
             # جلب SL/TP من حالة البوت — initial_sl وcurrent_sl
             bot_meta    = state_meta.get(slash_sym) or state_meta.get(symbol_raw) or {}
-            initial_sl  = float(bot_meta.get("sl",         0) or 0)
+            initial_sl  = float(bot_meta.get("initial_sl") or bot_meta.get("sl") or 0)
             current_sl  = float(bot_meta.get("current_sl", 0) or 0)
             tp          = float(bot_meta.get("tp",         0) or 0)
+            confirmed_source = "state"
+            if bool(getattr(Config, "LIVE_SL_UI_SYNC_ENABLED", True)):
+                try:
+                    protection = _client.get_position_protection_orders(
+                        slash_sym or symbol_raw,
+                        side if getattr(_client, "_is_hedge_mode", False) else None,
+                    )
+                    sl_orders = (protection or {}).get("sl_orders") or []
+                    confirmed_prices = [
+                        float(_client._order_trigger_price(order) or 0.0)
+                        for order in sl_orders
+                    ]
+                    confirmed_prices = [price for price in confirmed_prices if price > 0]
+                    if confirmed_prices:
+                        # There must be one protective leg; if legacy duplicates exist,
+                        # display the most protective confirmed price without mutating state.
+                        current_sl = (
+                            max(confirmed_prices) if side == "LONG" else min(confirmed_prices)
+                        )
+                        confirmed_source = "binance_algo_order"
+                except Exception as sync_error:
+                    logger.warning(
+                        f"[WebApp] تعذر مزامنة SL المؤكد لـ {slash_sym or symbol_raw}: "
+                        f"{sync_error}"
+                    )
             # نعرض current_sl دائماً إذا كان موجوداً (سواء تحرك أم لا)
             sl_moved = current_sl > 0
 
@@ -215,7 +267,18 @@ def _get_live_positions() -> list:
                 "roe_pct":        round(roe_pct, 2),
                 "leverage":       int(lev),
                 "sl":             initial_sl if initial_sl > 0 else None,
+                "initial_sl":     initial_sl if initial_sl > 0 else None,
                 "current_sl":     current_sl if sl_moved else None,
+                "current_sl_source": confirmed_source,
+                "current_sl_confirmed_at": bot_meta.get("current_sl_confirmed_at"),
+                "protection_stage": bot_meta.get("protection_stage") or "INITIAL_PROTECTION",
+                "unrealized_r": round(
+                    (
+                        (mark - entry) / abs(entry - initial_sl)
+                        if side == "LONG" else (entry - mark) / abs(entry - initial_sl)
+                    ) if initial_sl > 0 and entry != initial_sl else 0.0,
+                    3,
+                ),
                 "tp":             tp if tp > 0 else None,
                 "source":         "binance_live",
             })
@@ -240,6 +303,13 @@ def _positions_from_state() -> list:
             "unrealized_pnl": 0.0,
             "roe_pct":        0.0,
             "leverage":       int(meta.get("leverage", 1) or 1),
+            "sl":             float(meta.get("initial_sl") or meta.get("sl") or 0) or None,
+            "initial_sl":     float(meta.get("initial_sl") or meta.get("sl") or 0) or None,
+            "current_sl":     float(meta.get("current_sl") or 0) or None,
+            "current_sl_source": "state_json",
+            "current_sl_confirmed_at": meta.get("current_sl_confirmed_at"),
+            "protection_stage": meta.get("protection_stage") or "INITIAL_PROTECTION",
+            "tp":             float(meta.get("tp") or 0) or None,
             "source":         "state_json",
         })
     return result
@@ -391,6 +461,7 @@ def api_dashboard():
         "open_positions": open_positions,
         "chart":          chart,
         "wallet":         wallet,
+        "runtime_config": _effective_runtime_config(),
         "updated_at":     datetime.now().strftime("%H:%M:%S"),
     })
 

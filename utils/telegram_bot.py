@@ -409,7 +409,7 @@ class TelegramNotifier:
                 [
                     self._make_btn("⚙️ الحد الأقصى", "gui_setmax", "primary", icon_key="max_limit_gauge"),
                     self._make_btn("⚙️ الرافعة", "gui_leverage", "primary", icon_key="leverage_gauge"),
-                    self._make_btn("📊 نسبة الدخول", "gui_risk", "primary", icon_key="percentage_chart"),
+                    self._make_btn("🛡️ مخاطرة الوقف", "gui_risk", "primary", icon_key="percentage_chart"),
                 ],
                 [
                     self._make_btn("💰 محفظة محاكاة التقارير", "gui_ref_balance", "primary", icon_key="wallet_money"),
@@ -634,8 +634,11 @@ class TelegramNotifier:
         }
 
     def risk_keyboard(self, state_manager=None):
-        """لوحة اختيار نسبة المخاطرة لكل صفقة"""
-        current = state_manager.get_risk_pct() if state_manager else 1.0
+        """لوحة اختيار مخاطرة الوقف الأساسية لكل صفقة."""
+        current = (
+            state_manager.get_risk_pct()
+            if state_manager else float(Config.RISK_PER_TRADE_PERCENT)
+        )
 
         def label(v):
             return f"✅ {v}%" if abs(current - v) < 0.001 else f"{v}%"
@@ -1045,7 +1048,7 @@ class TelegramNotifier:
             {"command": "restart", "description": "إعادة تشغيل البوت بالكامل"},
             {"command": "stop", "description": "إيقاف طوارئ"},
             {"command": "help", "description": "شرح استخدام البوت"},
-            {"command": "set_risk",     "description": "تعديل نسبة المخاطرة — مثال: /set_risk 2"},
+            {"command": "set_risk",     "description": "تعديل مخاطرة الوقف — مثال: /set_risk 0.25"},
             {"command": "set_leverage", "description": "تعديل الرافعة المالية — مثال: /set_leverage 10"},
             {"command": "blacklist",    "description": "تجميد عملة — مثال: /blacklist BTCUSDT"},
             {"command": "whitelist",    "description": "رفع التجميد — مثال: /whitelist BTCUSDT"},
@@ -3136,7 +3139,7 @@ class TelegramNotifier:
                 self.send_message(
                     "⚠️ الاستخدام الصحيح:\n"
                     "<code>/set_risk [نسبة]</code>\n"
-                    "مثال: <code>/set_risk 2</code> (أي 2% من الرصيد لكل صفقة)\n"
+                    "مثال: <code>/set_risk 0.25</code> (حد خسارة الوقف كنسبة من الرصيد)\n"
                     f"النطاق المسموح: {Config.MIN_RISK_PER_TRADE_PERCENT} — "
                     f"{Config.HARD_MAX_RISK_PER_TRADE_PERCENT}"
                 )
@@ -3161,7 +3164,9 @@ class TelegramNotifier:
                         self._record_config_change(state_manager, "risk_percent", old, pct)
                         self.send_message(
                             f"✅ <b>تم تحديث نسبة المخاطرة</b>\n"
-                            f"القيمة الجديدة: <code>{pct}%</code> من الرصيد لكل صفقة.\n"
+                            f"القيمة الجديدة: <code>{pct}%</code> مخاطرة وقف أساسية من الرصيد.\n"
+                            f"هامش الدخول المستهدف مستقل ويبقى: "
+                            f"<code>{Config.ENTRY_MARGIN_PERCENT}%</code>.\n"
                             f"⚠️ سيُطبَّق على الصفقات الجديدة فقط.",
                             reply_markup=self.main_menu_keyboard()
                         )
@@ -3944,8 +3949,11 @@ class TelegramNotifier:
                 self.edit_message(
                     chat_id,
                     message_id,
-                    f"📊 <b>نسبة المخاطرة الحالية:</b> <code>{current_risk:.2f}%</code>\n"
-                    f"الهامش المستخدم لكل صفقة = <code>رصيدك × {current_risk:.2f}%</code>\n\n"
+                    f"🛡️ <b>مخاطرة الوقف الأساسية:</b> <code>{current_risk:.2f}%</code>\n"
+                    f"💵 <b>هامش الدخول المستهدف:</b> <code>{Config.ENTRY_MARGIN_PERCENT:.2f}%</code>\n"
+                    f"🚨 <b>سقف المخاطرة الصلب:</b> "
+                    f"<code>{Config.HARD_MAX_RISK_PER_TRADE_PERCENT:.2f}%</code>\n\n"
+                    "هذه القيم مستقلة: تغيير مخاطرة الوقف لا يغيّر هامش الدخول.\n\n"
                     f"اختر النسبة المطلوبة:",
                     self.risk_keyboard(state_manager),
                 )
@@ -3973,7 +3981,8 @@ class TelegramNotifier:
                 self.edit_message(
                     chat_id,
                     message_id,
-                    f"✅ تم تغيير نسبة الدخول إلى: <b>{new_risk}%</b> من رأس المال لكل صفقة.",
+                    f"✅ تم تغيير مخاطرة الوقف الأساسية إلى: <b>{new_risk}%</b>.\n"
+                    f"هامش الدخول المستهدف ما زال <b>{Config.ENTRY_MARGIN_PERCENT}%</b>.",
                     self.main_menu_keyboard(),
                 )
                 logger.info(f"تم تغيير نسبة المخاطرة إلى {new_risk}% عبر GUI تيليجرام.")

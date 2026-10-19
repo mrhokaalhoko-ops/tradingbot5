@@ -8,6 +8,7 @@ import math
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from core.config import Config
+from utils.json_normalizer import json_default, normalize_json_value
 from core.logger import logger
 
 
@@ -187,7 +188,10 @@ class TradeJournal:
             }
 
             with open(os.path.join(trade_dir, "trade_entry.json"), "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+                json.dump(
+                    normalize_json_value(payload), f, indent=2,
+                    ensure_ascii=False, default=json_default,
+                )
 
             # Snapshot قبل الدخول مباشرة للرجوع السريع
             entry_dt = self._parse_time(entry_meta.get("entry_time"))
@@ -241,7 +245,10 @@ class TradeJournal:
             }
 
             with open(os.path.join(trade_dir, "trade_summary.json"), "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2, ensure_ascii=False)
+                json.dump(
+                    normalize_json_value(summary), f, indent=2,
+                    ensure_ascii=False, default=json_default,
+                )
 
             for tf in self.timeframes:
                 try:

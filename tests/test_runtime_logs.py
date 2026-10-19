@@ -508,7 +508,7 @@ class TestRuntimeLogExport(unittest.TestCase):
 class TestLogSecretRedaction(unittest.TestCase):
     def test_known_and_contextual_secrets_never_pass(self):
         api_key = "ABCD1234567890SECRETKEYVALUE"
-        telegram_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+        telegram_token = "REDACTED_TEST_TELEGRAM_TOKEN"
         with patch.dict(os.environ, {
             "BINANCE_API_KEY": api_key,
             "TELEGRAM_BOT_TOKEN": telegram_token,

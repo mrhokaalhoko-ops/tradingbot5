@@ -1,6 +1,8 @@
 import time
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
+from core.config import Config
 from core.logger import logger
 
 class TrailingStopManager:
@@ -141,6 +143,15 @@ class TrailingStopManager:
         meta = self._state_manager.get_entry_metadata(symbol)
         if meta:
             meta["current_sl"] = float(trade.get("current_sl") or 0.0)
+            meta["current_sl_confirmed_at"] = trade.get("current_sl_confirmed_at")
+            meta["protection_stage"] = trade.get("protection_stage") or (
+                "STRUCTURAL_TRAIL_V2" if getattr(Config, "TRADE_MANAGEMENT_V2_ENABLED", False)
+                else "TRAILING_STOP_V1"
+            )
+            if trade.get("trailing_structure") is not None:
+                meta["trailing_structure"] = float(trade["trailing_structure"])
+            if trade.get("trailing_atr") is not None:
+                meta["trailing_atr"] = float(trade["trailing_atr"])
             meta["trailing_best_price"] = float(trade.get("best_price") or 0.0)
             meta["trailing_active"] = bool(trade.get("trailing_active", False))
             return bool(self._state_manager.save_entry_metadata(symbol, meta))
@@ -265,8 +276,14 @@ class TrailingStopManager:
         else:
             best_r = (entry - best_price) / risk
 
-        # لا نحرك الستوب قبل 1R
-        if best_r < self.break_even_at_r:
+        v2_enabled = bool(getattr(Config, "TRADE_MANAGEMENT_V2_ENABLED", False))
+        activation_r = (
+            float(getattr(Config, "TRADE_MANAGEMENT_V2_ACTIVATION_R", 1.5))
+            if v2_enabled else self.break_even_at_r
+        )
+
+        # V2 waits for meaningful progress; V1 preserves reviewed rollback.
+        if best_r < activation_r:
             return None
             
         if not trade['trailing_active']:
@@ -289,7 +306,46 @@ class TrailingStopManager:
         atr = self.calculate_atr(bars_df)
         candidates = []
 
-        if side == 'buy':
+        if v2_enabled:
+            swing = self.get_confirmed_swing(bars_df, side)
+            if swing is None:
+                self._audit(
+                    symbol, "V2_WAIT_STRUCTURE",
+                    {"best_r": best_r, "atr": atr, "current_sl": current_sl},
+                )
+                return None
+            buffer = atr * float(
+                getattr(Config, "TRADE_MANAGEMENT_V2_ATR_BUFFER", 0.30)
+            )
+            new_sl = float(swing - buffer if side == "buy" else swing + buffer)
+            # The first protection move must lock at least break-even and sit
+            # behind a confirmed swing.  Otherwise normal correction gets room.
+            profitable_side = new_sl >= entry if side == "buy" else new_sl <= entry
+            improves = new_sl > current_sl if side == "buy" else new_sl < current_sl
+            if not profitable_side or not improves:
+                return None
+            tick = float(client.get_price_tick_size(symbol) or 0.0)
+            min_improvement = max(
+                tick * 2.0,
+                atr * float(getattr(
+                    Config, "TRADE_MANAGEMENT_V2_MIN_ATR_IMPROVEMENT", 0.15
+                )),
+                risk * float(getattr(
+                    Config, "TRADE_MANAGEMENT_V2_MIN_RISK_IMPROVEMENT", 0.10
+                )),
+            )
+            if abs(new_sl - current_sl) < min_improvement:
+                self._audit(
+                    symbol, "V2_HYSTERESIS_SKIP",
+                    {"best_r": best_r, "old_sl": current_sl, "candidate_sl": new_sl,
+                     "min_improvement": min_improvement, "atr": atr, "swing": swing},
+                )
+                return None
+            trade["protection_stage"] = "STRUCTURAL_TRAIL_V2"
+            trade["trailing_structure"] = float(swing)
+            trade["trailing_atr"] = float(atr)
+
+        elif side == 'buy':
             # 1) Breakeven + Slippage
             candidates.append(entry * 1.001)
 
@@ -404,12 +460,29 @@ class TrailingStopManager:
                 )
                 return None
 
-            replaced_price = client.replace_sl_order(symbol, side.upper(), amount, new_sl)
-            ok_new = bool(replaced_price)
+            stateful_replace = getattr(client, "replace_sl_order_state", None)
+            stateful_declared = (
+                callable(getattr(type(client), "replace_sl_order_state", None))
+                or "replace_sl_order_state" in getattr(client, "__dict__", {})
+            )
+            if callable(stateful_replace) and stateful_declared:
+                replacement = stateful_replace(symbol, side.upper(), amount, new_sl)
+            else:
+                replaced_price = client.replace_sl_order(symbol, side.upper(), amount, new_sl)
+                replacement = {
+                    "state": "CONFIRMED" if replaced_price else "FAILED",
+                    "confirmed_stop": replaced_price or None,
+                    "requested_stop": new_sl,
+                    "reason": "LEGACY_BOOLEAN_RESULT",
+                }
+            replacement_state = str(replacement.get("state") or "FAILED")
+            ok_new = replacement_state in {"CONFIRMED", "NOOP_PROTECTED"}
             
             if ok_new:
-                new_sl = float(replaced_price)
+                new_sl = float(replacement.get("confirmed_stop"))
                 trade['current_sl'] = new_sl
+                trade["current_sl_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+                trade["protection_stage"] = trade.get("protection_stage") or "TRAILING_STOP_V1"
                 if not self._persist_runtime_state(symbol):
                     logger.critical(
                         f"[Trailing] تم تحديث SL على Binance لـ {symbol} لكن تعذر حفظ حالته محلياً."
@@ -421,6 +494,26 @@ class TrailingStopManager:
                      "best_price": best_price, "atr": atr, "amount": amount}, durable=True,
                 )
                 return new_sl
+            elif replacement_state == "PENDING_VERIFICATION":
+                # ACK/timeout with a durable reconciliation saga is not a
+                # failure.  Keep the last exchange-confirmed stop in force and
+                # let the monitor recover/query before another candidate is
+                # attempted.
+                trade['_sl_retry_after'] = max(
+                    float(replacement.get("retry_after") or 0.0),
+                    time.time() + 2.0,
+                )
+                self._audit(
+                    symbol, "SL_REPLACE_PENDING_VERIFICATION",
+                    {"best_r": best_r, "old_sl": current_sl,
+                     "requested_sl": new_sl, "reason": replacement.get("reason")},
+                    durable=True,
+                )
+                logger.info(
+                    f"[Trailing] استبدال SL لـ {symbol} قيد إثبات Binance؛ "
+                    f"الوقف المؤكد يبقى {current_sl}."
+                )
+                return None
             else:
                 logger.critical(f"[Trailing] تعذر استبدال SL لـ {symbol}؛ الوقف القديم بقي قائماً عند {current_sl}")
                 trade['_failed_sl'] = new_sl
@@ -446,6 +539,44 @@ class TrailingStopManager:
 
     def get_trade_info(self, symbol: str) -> dict | None:
         return self._trades.get(symbol)
+
+    def sync_confirmed_stop(self, symbol: str, confirmed_stop: float, confirmed_at=None) -> bool:
+        """Synchronize exchange-proven protection without permitting regression."""
+        trade = self._trades.get(symbol)
+        try:
+            confirmed_stop = float(confirmed_stop or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if not trade or confirmed_stop <= 0:
+            return False
+        current = float(trade.get("current_sl") or trade.get("initial_sl") or 0.0)
+        side = str(trade.get("side") or "").lower()
+        if current > 0:
+            regresses = (
+                (side == "buy" and confirmed_stop < current) or
+                (side == "sell" and confirmed_stop > current)
+            )
+            if regresses:
+                self._audit(
+                    symbol, "CONFIRMED_STOP_REGRESSION_REJECTED",
+                    {"local_stop": current, "exchange_stop": confirmed_stop},
+                    durable=True,
+                )
+                return False
+            if abs(confirmed_stop - current) <= max(abs(current) * 1e-10, 1e-12):
+                return True
+        trade["current_sl"] = confirmed_stop
+        trade["current_sl_confirmed_at"] = confirmed_at or datetime.now(timezone.utc).isoformat()
+        trade.pop("_failed_sl", None)
+        trade["_failed_sl_count"] = 0
+        trade.pop("_sl_retry_after", None)
+        persisted = self._persist_runtime_state(symbol)
+        self._audit(
+            symbol, "CONFIRMED_STOP_SYNCHRONIZED",
+            {"previous_stop": current, "confirmed_stop": confirmed_stop,
+             "persisted": bool(persisted)}, durable=True,
+        )
+        return bool(persisted)
 
     def has_trade(self, symbol: str) -> bool:
         return symbol in self._trades

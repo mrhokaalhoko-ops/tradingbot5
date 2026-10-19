@@ -505,7 +505,7 @@ class TestTelegramUiParity(unittest.TestCase):
     def test_release_version_is_1_6_18(self):
         from core.version import APP_VERSION
 
-        self.assertEqual(APP_VERSION, "1.6.18")
+        self.assertEqual(APP_VERSION, "1.6.19")
 
 
 if __name__ == "__main__":

@@ -303,7 +303,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
         client._create_close_position_protection = Mock(
             side_effect=TimeoutError("send status unknown")
         )
-        client.resolve_order_by_client_id = Mock(return_value={
+        client.resolve_algo_order_by_client_id = Mock(return_value={
             "status": "FOUND", "order": {"id": "adopted", "status": "NEW"},
         })
 
@@ -313,7 +313,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
             call.args[3] for call in state.transition_protection_replacement.call_args_list
         ]
         self.assertIn("NEW_ACKNOWLEDGED", phases)
-        client.resolve_order_by_client_id.assert_called_once_with(
+        client.resolve_algo_order_by_client_id.assert_called_once_with(
             "BTC/USDT", "stable-new-sl"
         )
 
@@ -880,6 +880,106 @@ class TestFullPositionStepTrail(unittest.TestCase):
         self.assertEqual(trade["full_amount"], 2.0)
         self.assertEqual(trade["initial_sl"], 95.0)
         self.assertEqual(trade["current_sl"], 101.0)
+
+
+class TestProtectionReplacementStateContract(unittest.TestCase):
+    def _client(self):
+        client = ExchangeClient.__new__(ExchangeClient)
+        client.normalize_price = Mock(side_effect=lambda _symbol, value: float(value))
+        client._stop_prices_equal = Mock(
+            side_effect=lambda first, second: abs(float(first) - float(second)) < 1e-9
+        )
+        return client
+
+    def test_acknowledged_durable_saga_is_pending_not_failed(self):
+        client = self._client()
+        state = Mock()
+        state.get_protection_replacement.return_value = {
+            "phase": "NEW_ACKNOWLEDGED",
+            "replacement_id": "replace-1",
+            "retry_after": 123.0,
+        }
+        client._state_manager = state
+        client.replace_sl_order = Mock(return_value=False)
+
+        result = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+
+        self.assertEqual(result["state"], "PENDING_VERIFICATION")
+        self.assertEqual(result["reason"], "NEW_ACKNOWLEDGED")
+        self.assertEqual(result["saga_id"], "replace-1")
+
+    def test_terminal_saga_failure_is_explicit(self):
+        client = self._client()
+        state = Mock()
+        state.get_protection_replacement.return_value = {
+            "phase": "EMERGENCY_CLOSE_REQUESTED",
+        }
+        client._state_manager = state
+        client.replace_sl_order = Mock(return_value=False)
+
+        result = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+
+        self.assertEqual(result["state"], "FAILED")
+        self.assertEqual(result["reason"], "EMERGENCY_CLOSE_REQUESTED")
+
+    def test_confirmed_and_noop_states_preserve_exchange_stop(self):
+        client = self._client()
+        client._state_manager = None
+        client.replace_sl_order = Mock(return_value=99.0)
+        confirmed = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+        self.assertEqual(confirmed["state"], "CONFIRMED")
+        self.assertEqual(confirmed["confirmed_stop"], 99.0)
+
+        client.replace_sl_order.return_value = 99.5
+        noop = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+        self.assertEqual(noop["state"], "NOOP_PROTECTED")
+        self.assertEqual(noop["confirmed_stop"], 99.5)
+
+    def test_pending_trailing_replacement_is_not_counted_as_failure(self):
+        manager = TrailingStopManager()
+        manager.register_trade("BTC/USDT", "BUY", 100.0, 95.0, amount=1.0)
+        manager.calculate_atr = Mock(return_value=1.0)
+        manager.get_confirmed_swing = Mock(return_value=None)
+        client = Mock()
+        client.fetch_ohlcv.return_value = [
+            [index, 100.0, 101.0, 99.0, 100.5, 1.0] for index in range(30)
+        ]
+        client.normalize_price.side_effect = lambda _symbol, value: float(value)
+        client.get_position_amount.return_value = 1.0
+        client.replace_sl_order_state = Mock(return_value={
+            "state": "PENDING_VERIFICATION",
+            "reason": "NEW_ACKNOWLEDGED",
+            "retry_after": time.time() + 10,
+        })
+
+        self.assertIsNone(manager.update("BTC/USDT", 106.0, client))
+
+        trade = manager.get_trade_info("BTC/USDT")
+        self.assertEqual(trade["current_sl"], 95.0)
+        self.assertEqual(trade.get("_failed_sl_count", 0), 0)
+        self.assertNotIn("_failed_sl", trade)
+        self.assertGreater(trade.get("_sl_retry_after", 0), time.time())
+
+    def test_async_confirmation_synchronizes_without_regression(self):
+        state = Mock()
+        state.get_trailing_trades.return_value = {}
+        state.get_entry_metadata.return_value = {}
+        state.save_trailing_trades.return_value = True
+        manager = TrailingStopManager(state_manager=state)
+        manager.register_trade("BTC/USDT", "BUY", 100.0, 95.0, amount=1.0)
+        trade = manager.get_trade_info("BTC/USDT")
+        trade["_failed_sl"] = 98.0
+        trade["_failed_sl_count"] = 2
+        trade["_sl_retry_after"] = time.time() + 30
+
+        self.assertTrue(manager.sync_confirmed_stop("BTC/USDT", 99.0))
+        self.assertEqual(manager.get_current_sl("BTC/USDT"), 99.0)
+        self.assertEqual(trade["_failed_sl_count"], 0)
+        self.assertNotIn("_failed_sl", trade)
+        self.assertNotIn("_sl_retry_after", trade)
+
+        self.assertFalse(manager.sync_confirmed_stop("BTC/USDT", 98.0))
+        self.assertEqual(manager.get_current_sl("BTC/USDT"), 99.0)
 
 
 class TestUnifiedEntryExecutionGate(unittest.TestCase):

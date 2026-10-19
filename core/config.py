@@ -55,6 +55,32 @@ class Config:
     STRUCTURAL_INITIAL_STOP_V1_ENABLED = os.getenv(
         "STRUCTURAL_INITIAL_STOP_V1_ENABLED", "false"
     ).strip().lower() in ("true", "1", "yes")
+    # Independent strategy rollbacks.  V2 changes only initial invalidation
+    # selection and post-entry management; opportunity detection is untouched.
+    STRUCTURAL_STOP_V2_ENABLED = os.getenv(
+        "STRUCTURAL_STOP_V2_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    TRADE_MANAGEMENT_V2_ENABLED = os.getenv(
+        "TRADE_MANAGEMENT_V2_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    PROTECTION_NOTIFICATION_DEDUP_ENABLED = os.getenv(
+        "PROTECTION_NOTIFICATION_DEDUP_ENABLED", "true"
+    ).strip().lower() in ("true", "1", "yes")
+    LIVE_SL_UI_SYNC_ENABLED = os.getenv(
+        "LIVE_SL_UI_SYNC_ENABLED", "true"
+    ).strip().lower() in ("true", "1", "yes")
+    TRADE_MANAGEMENT_V2_ACTIVATION_R = float(
+        os.getenv("TRADE_MANAGEMENT_V2_ACTIVATION_R", "1.5")
+    )
+    TRADE_MANAGEMENT_V2_ATR_BUFFER = float(
+        os.getenv("TRADE_MANAGEMENT_V2_ATR_BUFFER", "0.30")
+    )
+    TRADE_MANAGEMENT_V2_MIN_ATR_IMPROVEMENT = float(
+        os.getenv("TRADE_MANAGEMENT_V2_MIN_ATR_IMPROVEMENT", "0.15")
+    )
+    TRADE_MANAGEMENT_V2_MIN_RISK_IMPROVEMENT = float(
+        os.getenv("TRADE_MANAGEMENT_V2_MIN_RISK_IMPROVEMENT", "0.10")
+    )
     STRUCTURAL_STOP_ROUND_TRIP_COST_PCT = float(
         os.getenv("STRUCTURAL_STOP_ROUND_TRIP_COST_PCT", "0.0012")
     )

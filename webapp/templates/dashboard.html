@@ -1663,6 +1663,19 @@
 
       /* ── Open Positions ── */
       const ops = data.open_positions || [];
+      const rc = data.runtime_config || {};
+      html += `
+    <div class="section-head fade-in" style="animation-delay:.13s">
+      <div class="icon">⚙️</div><div class="label">إعدادات التنفيذ الفعلية</div>
+    </div>
+    <div class="pos-card fade-in" style="animation-delay:.135s;display:block;padding:10px;">
+      <div class="pos-meta" style="display:grid;grid-template-columns:1fr 1fr;gap:7px;">
+        <span>هامش الدخول: <strong>${Number(rc.entry_margin_percent || 0).toFixed(2)}%</strong></span>
+        <span>مخاطرة الوقف: <strong>${Number(rc.base_stop_risk_percent || 0).toFixed(2)}%</strong></span>
+        <span>سقف المخاطرة الصلب: <strong>${Number(rc.hard_risk_cap_percent || 0).toFixed(2)}%</strong></span>
+        <span>الرافعة: <strong>${Number(rc.leverage || 0)}x</strong></span>
+      </div>
+    </div>`;
       html += `
     <div class="section-head fade-in" style="animation-delay:.14s">
       <div class="icon"><img src="/static/icons/lightning%20bolt.png" alt="" onerror="this.parentElement.textContent='⚡'"></div>
@@ -1709,12 +1722,17 @@
           <div class="pos-meta" style="background:var(--surface2); padding:8px 10px; border-radius:6px; justify-content:space-between; border: 1px solid ${slMoved ? 'var(--gold)' : 'var(--border)'}; margin-top:4px; flex-direction:column; gap:5px; ${slMoved ? 'box-shadow:0 0 10px rgba(240, 185, 11, 0.15);' : ''}">
              <div style="display:flex; justify-content:space-between;">
                ${p.sl ? `<span class="sl" style="${slMoved ? 'text-decoration:line-through; opacity:0.5;' : ''}"><img src="/static/icons/stop%20sign%20emergency.png" alt="" style="width:11px;height:11px;vertical-align:middle;margin-left:2px;" onerror="this.style.display='none'">SL الأصلي: <strong>${slInit.toFixed(5)}</strong></span>` : '<span class="sl" style="opacity:0.5">SL: غير محدد</span>'}
-               ${p.tp ? `<span class="tp">🎯 TP: <strong>${parseFloat(p.tp).toFixed(5)}</strong></span>` : '<span class="tp" style="opacity:0.5">TP: غير محدد</span>'}
+               ${p.tp ? `<span class="tp">🎯 الهدف النهائي: <strong>${parseFloat(p.tp).toFixed(5)}</strong></span>` : '<span class="tp" style="opacity:0.5">الهدف النهائي: غير محدد</span>'}
              </div>
-             ${slMoved ? `<div style="display:flex; align-items:center; gap:4px; color:var(--gold); font-size:10px; animation: pulse-gold 1.5s ease-in-out infinite;">
+              ${slMoved ? `<div style="display:flex; align-items:center; gap:4px; color:var(--gold); font-size:10px; animation: pulse-gold 1.5s ease-in-out infinite;">
                <img src="/static/icons/shield%20protection.png" alt="" style="width:12px;height:12px;" onerror="this.style.display='none'">
-               SL انتقل لصالحك 🚀 الآن عند: <strong style="font-family:'JetBrains Mono',monospace;">${slCurr.toFixed(5)}</strong>
-             </div>` : ''}
+                SL المؤكد حاليًا: <strong style="font-family:'JetBrains Mono',monospace;">${slCurr.toFixed(5)}</strong>
+              </div>` : `<div style="color:var(--text3);font-size:10px;">SL المؤكد حاليًا: ${slCurr > 0 ? slCurr.toFixed(5) : 'غير متاح'}</div>`}
+              <div style="display:flex;justify-content:space-between;color:var(--text3);font-size:9px;">
+                <span>مرحلة الحماية: ${p.protection_stage || 'INITIAL_PROTECTION'}</span>
+                <span>R غير المحقق: ${Number(p.unrealized_r || 0).toFixed(2)}R</span>
+              </div>
+              <div style="color:var(--text3);font-size:9px;">آخر تأكيد: ${p.current_sl_confirmed_at || 'الوقف الأولي'} · المصدر: ${p.current_sl_source || 'state'}</div>
           </div>`;
           })()}
         </div>`;

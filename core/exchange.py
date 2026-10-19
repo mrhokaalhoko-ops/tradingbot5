@@ -2,6 +2,7 @@ import ccxt
 import pandas as pd
 import time
 import threading
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from core.config import Config
 from core.logger import logger
@@ -351,6 +352,93 @@ class ExchangeClient:
             "detail": str(detail or ""),
         }
 
+    def _set_protection_replacement_failure(
+        self, *, symbol, side, amount, current_algo_id=None, old_sl=0.0,
+        requested_sl=0.0, reason="UNKNOWN", error=None, retry_count=0,
+    ):
+        evidence = self._sanitize_exchange_error(error) if error else {
+            "code": None, "message": "", "type": ""
+        }
+        self.last_protection_replacement_failure = {
+            "symbol": str(symbol or ""),
+            "side": str(side or "").upper(),
+            "position_qty": float(amount or 0.0),
+            "current_algo_id": str(current_algo_id or ""),
+            "old_sl": float(old_sl or 0.0),
+            "requested_sl": float(requested_sl or 0.0),
+            "endpoint": "/fapi/v1/algoOrder",
+            "binance_code": evidence.get("code"),
+            "binance_message": evidence.get("message"),
+            "error_type": evidence.get("type"),
+            "retry_count": int(retry_count or 0),
+            "reason": str(reason or "UNKNOWN"),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.error(
+            "[ProtectionReplace] symbol=%s side=%s qty=%s algo_id=%s "
+            "old_sl=%s requested_sl=%s endpoint=%s code=%s reason=%s message=%s",
+            self.last_protection_replacement_failure["symbol"],
+            self.last_protection_replacement_failure["side"],
+            self.last_protection_replacement_failure["position_qty"],
+            self.last_protection_replacement_failure["current_algo_id"],
+            self.last_protection_replacement_failure["old_sl"],
+            self.last_protection_replacement_failure["requested_sl"],
+            self.last_protection_replacement_failure["endpoint"],
+            self.last_protection_replacement_failure["binance_code"],
+            self.last_protection_replacement_failure["reason"],
+            self.last_protection_replacement_failure["binance_message"],
+        )
+
+    @staticmethod
+    def _sanitize_exchange_error(exc):
+        """Keep Binance code/message for forensics without request signatures."""
+        text = str(exc or "")
+        for marker in ("signature=", "X-MBX-APIKEY", "apiKey="):
+            if marker in text:
+                text = text.split(marker, 1)[0] + marker + "REDACTED"
+        code = None
+        for candidate in (
+            getattr(exc, "code", None),
+            (getattr(exc, "response", None) or {}).get("code")
+            if isinstance(getattr(exc, "response", None), dict) else None,
+        ):
+            try:
+                code = int(candidate)
+                break
+            except (TypeError, ValueError):
+                pass
+        if code is None:
+            import re
+            match = re.search(r"(?:code[\"']?\s*[:=]\s*|\b)(-\d{3,6})\b", text)
+            if match:
+                code = int(match.group(1))
+        return {"code": code, "message": text[:500], "type": type(exc).__name__}
+
+    @classmethod
+    def _is_definitive_exchange_reject(cls, exc):
+        evidence = cls._sanitize_exchange_error(exc)
+        code = evidence.get("code")
+        if isinstance(code, int) and code < 0 and code not in {-1001, -1007, -1008}:
+            return True, evidence
+        name = str(evidence.get("type") or "").lower()
+        message = str(evidence.get("message") or "").lower()
+        transport = any(token in name or token in message for token in (
+            "timeout", "network", "connection", "temporarily unavailable",
+            "gateway timeout", "service unavailable",
+        ))
+        explicit = any(token in name for token in (
+            "invalidorder", "insufficientfunds", "authenticationerror",
+            "permissiondenied", "badrequest",
+        ))
+        return bool(explicit and not transport), evidence
+
+    @staticmethod
+    def _raw_market_filter(market, filter_type):
+        for item in ((market or {}).get("info") or {}).get("filters", []) or []:
+            if str((item or {}).get("filterType") or "").upper() == filter_type:
+                return item or {}
+        return {}
+
     def _validate_order_market_rules(self, symbol, amount, ref_price, market=None):
         """تطبيع وفحص قواعد Binance؛ أي metadata ناقصة تفشل مغلقة."""
         resolved_symbol = symbol
@@ -359,50 +447,101 @@ class ExchangeClient:
         else:
             resolved_symbol = str(market.get("symbol") or symbol)
         if not isinstance(market, dict) or not market:
+            self._set_execution_failure(
+                "MARKET_METADATA_UNAVAILABLE", symbol, send_attempted=False
+            )
             logger.critical(f"[{symbol}] رُفض الدخول: market metadata غير متاحة.")
             return None
         if market.get("active") is False:
+            self._set_execution_failure(
+                "MARKET_INACTIVE", symbol, send_attempted=False
+            )
             logger.critical(f"[{symbol}] رُفض الدخول: السوق غير نشط على Binance.")
             return None
 
         normalized_amount = self.normalize_amount(resolved_symbol, amount)
         if normalized_amount is None or normalized_amount <= 0:
+            self._set_execution_failure(
+                "MARKET_AMOUNT_INVALID", symbol, send_attempted=False,
+                detail=f"requested={amount}",
+            )
             logger.critical(f"[{symbol}] رُفض الدخول: الكمية بعد التطبيع غير صالحة.")
             return None
 
         limits = market.get("limits")
         if not isinstance(limits, dict):
+            self._set_execution_failure(
+                "MARKET_LIMITS_UNAVAILABLE", symbol, send_attempted=False
+            )
             logger.critical(f"[{symbol}] رُفض الدخول: limits metadata غير متاحة.")
             return None
         amount_limits = limits.get("amount") or {}
         cost_limits = limits.get("cost") or {}
-        min_qty = self._positive_rule(amount_limits.get("min"))
+        lot = self._raw_market_filter(market, "LOT_SIZE")
+        market_lot = self._raw_market_filter(market, "MARKET_LOT_SIZE")
+        min_candidates = [
+            self._positive_rule(amount_limits.get("min")),
+            self._positive_rule(lot.get("minQty")),
+            self._positive_rule(market_lot.get("minQty")),
+        ]
+        min_candidates = [value for value in min_candidates if value is not None]
+        min_qty = max(min_candidates) if min_candidates else None
         min_notional = self._positive_rule(cost_limits.get("min"))
 
         # Binance USD-M تنشر LOT_SIZE وMIN_NOTIONAL. غيابهما غالباً يعني أن
         # load_markets/cache لم يكتمل، وليس تصريحاً بتجاوز الفحص.
         if min_qty is None or min_notional is None:
+            self._set_execution_failure(
+                "MARKET_MIN_RULES_UNAVAILABLE", symbol, send_attempted=False,
+                detail=f"minQty={min_qty};minNotional={min_notional}",
+            )
             logger.critical(
                 f"[{symbol}] رُفض الدخول: minQty/minNotional غير موثوقين في metadata."
             )
             return None
         if normalized_amount < min_qty:
+            self._set_execution_failure(
+                "MARKET_MIN_QTY_NOT_MET", symbol, send_attempted=False,
+                detail=f"requested={normalized_amount};minQty={min_qty}",
+            )
             logger.warning(
                 f"[{symbol}] الكمية {normalized_amount:.8f} أقل من الحد الأدنى {min_qty}."
             )
             return None
-        max_qty = self._positive_rule(amount_limits.get("max"))
+        max_candidates = [
+            self._positive_rule(amount_limits.get("max")),
+            self._positive_rule(lot.get("maxQty")),
+            self._positive_rule(market_lot.get("maxQty")),
+        ]
+        max_candidates = [value for value in max_candidates if value is not None]
+        max_qty = min(max_candidates) if max_candidates else None
         if max_qty is not None and normalized_amount > max_qty:
             logger.warning(
                 f"[{symbol}] الكمية {normalized_amount:.8f} أعلى من الحد الأقصى {max_qty}."
             )
+            self._set_execution_failure(
+                "MARKET_MAX_QTY_EXCEEDED",
+                symbol,
+                send_attempted=False,
+                detail=(
+                    f"requested={normalized_amount};maxQty={max_qty};"
+                    f"lot={lot.get('maxQty')};marketLot={market_lot.get('maxQty')}"
+                ),
+            )
             return None
         ref_price = self._positive_rule(ref_price)
         if ref_price is None:
+            self._set_execution_failure(
+                "MARKET_REFERENCE_PRICE_UNAVAILABLE", symbol, send_attempted=False
+            )
             logger.critical(f"[{symbol}] رُفض الدخول: لا يوجد سعر حديث لفحص notional.")
             return None
         notional = normalized_amount * ref_price
         if notional < min_notional:
+            self._set_execution_failure(
+                "MARKET_MIN_NOTIONAL_NOT_MET", symbol, send_attempted=False,
+                detail=f"notional={notional};minNotional={min_notional}",
+            )
             logger.warning(
                 f"[{symbol}] قيمة الصفقة {notional:.2f} أقل من الحد الأدنى "
                 f"{min_notional} USDT."
@@ -410,6 +549,10 @@ class ExchangeClient:
             return None
         max_notional = self._positive_rule(cost_limits.get("max"))
         if max_notional is not None and notional > max_notional:
+            self._set_execution_failure(
+                "MARKET_MAX_NOTIONAL_EXCEEDED", symbol, send_attempted=False,
+                detail=f"notional={notional};maxNotional={max_notional}",
+            )
             logger.warning(
                 f"[{symbol}] قيمة الصفقة {notional:.2f} أعلى من الحد الأقصى "
                 f"{max_notional} USDT."
@@ -455,6 +598,51 @@ class ExchangeClient:
                     f"[AlgoOrderRecovery] تعذر استرجاع {client_order_id} لـ {symbol}: {exc}"
                 )
             return None
+
+    def resolve_algo_order_by_client_id(self, symbol, client_order_id):
+        """Resolve one conditional Algo order without collapsing uncertainty.
+
+        A timeout after POST may mean Binance accepted the order.  Only a
+        successful signed Algo query can prove it exists, and only Binance's
+        explicit not-found response can prove it does not.  Transport/parser
+        failures remain UNKNOWN and must never trigger a blind POST retry.
+        """
+        if not client_order_id:
+            return {
+                "status": "UNKNOWN", "order": None,
+                "reason": "MISSING_CLIENT_ALGO_ID",
+            }
+        try:
+            market = self.exchange.market(symbol)
+            raw = self.exchange.fapiPrivateGetAlgoOrder({
+                "symbol": market["id"],
+                "clientAlgoId": str(client_order_id),
+            })
+            order = self._normalize_algo_order(raw)
+            if not isinstance(order, dict) or not order:
+                return {
+                    "status": "UNKNOWN", "order": None,
+                    "reason": "UNPARSEABLE_ALGO_ORDER_RESPONSE",
+                }
+            return {
+                "status": "FOUND", "order": order,
+                "reason": "ALGO_ORDER_QUERY_CONFIRMED",
+            }
+        except Exception as exc:
+            code = self._exchange_error_code(exc)
+            if code == -2013:
+                return {
+                    "status": "NOT_FOUND", "order": None,
+                    "reason": "BINANCE_ALGO_ORDER_DOES_NOT_EXIST", "code": code,
+                }
+            logger.warning(
+                f"[AlgoOrderRecovery] حالة الأمر {client_order_id} لـ {symbol} "
+                f"غير معروفة: {exc}"
+            )
+            return {
+                "status": "UNKNOWN", "order": None,
+                "reason": type(exc).__name__, "code": code,
+            }
 
     def _find_order_by_client_id(self, symbol, client_order_id):
         """استرجاع الأمر بعد timeout، مع أولوية واجهة Algo لأوامر SL/TP."""
@@ -695,9 +883,10 @@ class ExchangeClient:
                 )
                 return None
             if amount is None:
-                self._set_execution_failure(
-                    "MARKET_RULE_VALIDATION_FAILED", symbol, send_attempted=False
-                )
+                if not self.last_execution_failure:
+                    self._set_execution_failure(
+                        "MARKET_RULE_VALIDATION_FAILED", symbol, send_attempted=False
+                    )
                 return None
 
             order_type = 'market' if not price else 'limit'
@@ -742,12 +931,22 @@ class ExchangeClient:
             return order
         except Exception as e:
             logger.error(f"فشل تنفيذ الصفقة لـ {symbol}: {e}")
+            definitive_reject, rejection = self._is_definitive_exchange_reject(e)
             self._set_execution_failure(
-                "ORDER_SUBMISSION_UNRESOLVED" if send_attempted else "LOCAL_PRE_SUBMIT_ERROR",
+                (
+                    "ENTRY_REJECTED_BY_EXCHANGE"
+                    if send_attempted and definitive_reject
+                    else "ORDER_SUBMISSION_UNRESOLVED"
+                    if send_attempted else "LOCAL_PRE_SUBMIT_ERROR"
+                ),
                 symbol,
                 send_attempted=send_attempted,
-                detail=type(e).__name__,
+                detail=(
+                    f"code={rejection.get('code')};message={rejection.get('message')}"
+                ),
             )
+            if definitive_reject:
+                return None
             # Timeout قد يعني أن Matching Engine نفذ الأمر رغم غياب الرد.
             # لا نعيد None قبل محاولة الاسترجاع بمعرف idempotency.
             recovered = self._find_order_by_client_id(
@@ -890,6 +1089,8 @@ class ExchangeClient:
             "sl_client_id": sl_client_id if sl_order else None,
             "tp_client_id": tp_client_id if tp_order else None,
             "working_type": "MARK_PRICE",
+            "sl_price": self._order_trigger_price(sl_order) if sl_order else None,
+            "tp_price": self._order_trigger_price(tp_order) if tp_order else None,
         }
 
     def place_sl_tp(self, symbol, side, amount, sl_price, tp_price, client_order_prefix=None):
@@ -1360,7 +1561,9 @@ class ExchangeClient:
             )
             return {"status": "ACKNOWLEDGED", "order": order}
         except Exception as exc:
-            resolution = self.resolve_order_by_client_id(symbol, client_order_id)
+            resolution = self.resolve_algo_order_by_client_id(
+                symbol, client_order_id
+            )
             if resolution.get("status") == "FOUND":
                 order = resolution.get("order") or {}
                 venue_status = str(order.get("status") or "").upper()
@@ -1445,8 +1648,56 @@ class ExchangeClient:
                 symbol, position_side if self._is_hedge_mode else None
             )
 
+        def _confirm_new_stop(order, observed_price):
+            """Persist only a stop proven by an exchange read response."""
+            if not self._stop_is_at_least_as_protective(side, observed_price, new_stop):
+                _transition(
+                    "BLOCKED_STOP_MISMATCH",
+                    {
+                        "observed_stop": observed_price,
+                        "requested_stop": new_stop,
+                        "retry_after": time.time() + 30,
+                    },
+                )
+                return False
+            meta = state_manager.get_entry_metadata(symbol) or {}
+            if meta:
+                meta.setdefault("initial_sl", float(meta.get("sl") or observed_price))
+                meta["current_sl"] = observed_price
+                meta["current_sl_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+                meta["sl_order_id"] = order.get("id")
+                if not state_manager.save_entry_metadata(symbol, meta):
+                    _transition(
+                        "NEW_VERIFIED_STATE_PENDING",
+                        {"verified_stop": observed_price, "retry_after": time.time() + 5},
+                    )
+                    return False
+            if not _archive(
+                "NEW_VERIFIED",
+                {"verified_stop": observed_price, "order_id": order.get("id")},
+            ):
+                return False
+            return observed_price
+
+        def _emergency_close(reason):
+            if str(saga.get("phase") or "") == "EMERGENCY_CLOSE_REQUESTED":
+                return False
+            if not _transition("EMERGENCY_CLOSE_REQUESTED", {"reason": reason}):
+                return False
+            logger.critical(
+                f"[{symbol}] تعذر إثبات/استعادة SL؛ إرسال إغلاق طوارئ durable "
+                f"({reason})."
+            )
+            self.close_position(symbol, side, amount)
+            return False
+
         retry_after = float(saga.get("retry_after") or 0.0)
         if retry_after > time.time():
+            return False
+        if str(saga.get("phase") or "") in {
+            "EMERGENCY_CLOSE_REQUESTED", "UNPROTECTED_CRITICAL",
+            "BLOCKED_MULTIPLE_STOPS", "BLOCKED_STOP_MISMATCH",
+        }:
             return False
 
         live = self.get_position_status(
@@ -1464,9 +1715,16 @@ class ExchangeClient:
 
         snapshot = _verify_snapshot()
         if snapshot.get("status") == "UNKNOWN":
+            self._set_protection_replacement_failure(
+                symbol=symbol, side=side, amount=amount,
+                old_sl=old_stop, requested_sl=new_stop,
+                reason="PROTECTION_QUERY_UNKNOWN",
+                retry_count=int(saga.get("retry_count") or 0),
+            )
             _transition("WAIT_SNAPSHOT", {"retry_after": time.time() + 15})
             return False
         sl_orders = snapshot.get("sl_orders") or []
+        phase = str(saga.get("phase") or "")
         if len(sl_orders) > 1:
             _transition(
                 "BLOCKED_MULTIPLE_STOPS",
@@ -1481,6 +1739,106 @@ class ExchangeClient:
             )
             return False
 
+        # A fresh open-orders snapshot is already authoritative proof.  Use it
+        # before client-id recovery so an eventually-consistent query endpoint
+        # cannot hide a stop that the open Algo order feed has confirmed.
+        if len(sl_orders) == 1:
+            observed_snapshot_price = self._order_trigger_price(sl_orders[0])
+            if self._stop_is_at_least_as_protective(
+                side, observed_snapshot_price, new_stop
+            ):
+                return _confirm_new_stop(sl_orders[0], observed_snapshot_price)
+
+        # A prior POST may have been accepted even when the local response was
+        # lost.  On ACK/UNKNOWN recovery we query the deterministic client id;
+        # we never issue the protection POST again blindly.
+        pending_new_phases = {
+            "NEW_ACKNOWLEDGED", "NEW_STATUS_UNKNOWN", "PROTECTION_UNCERTAIN",
+            "WAIT_NEW_STATUS", "NEW_VERIFIED_STATE_PENDING",
+        }
+        pending_new_resolution = None
+        if phase in pending_new_phases:
+            pending_new_resolution = self.resolve_algo_order_by_client_id(
+                symbol, saga.get("new_client_order_id")
+            )
+            resolution_status = str(pending_new_resolution.get("status") or "UNKNOWN")
+            if resolution_status == "FOUND":
+                resolved_order = pending_new_resolution.get("order") or {}
+                venue_status = str(resolved_order.get("status") or "").upper()
+                if venue_status in {
+                    "CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
+                    "EXPIRED_IN_MATCH",
+                }:
+                    pending_new_resolution = {"status": "NOT_FOUND"}
+                else:
+                    resolved_price = self._order_trigger_price(resolved_order) or new_stop
+                    if sl_orders:
+                        listed_ids = {str(order.get("id")) for order in sl_orders}
+                        resolved_id = str(resolved_order.get("id"))
+                        listed_prices = {
+                            self._order_trigger_price(order) for order in sl_orders
+                        }
+                        if resolved_id not in listed_ids and resolved_price not in listed_prices:
+                            _transition(
+                                "BLOCKED_MULTIPLE_STOPS",
+                                {
+                                    "observed_order_ids": sorted(listed_ids | {resolved_id}),
+                                    "retry_after": time.time() + 30,
+                                },
+                            )
+                            return False
+                    return _confirm_new_stop(resolved_order, resolved_price)
+            if str(pending_new_resolution.get("status") or "UNKNOWN") == "UNKNOWN":
+                _transition(
+                    "PROTECTION_UNCERTAIN",
+                    {
+                        "last_error": pending_new_resolution.get("reason"),
+                        "retry_after": time.time() + 15,
+                    },
+                )
+                return False
+            # The exchange authoritatively says the attempted new stop does
+            # not exist.  If the old stop is still present, retain it and end
+            # the upgrade as a safe NOOP rather than cancelling it again.
+            if sl_orders:
+                observed_price = self._order_trigger_price(sl_orders[0])
+                _archive(
+                    "UPGRADE_NOT_APPLIED_OLD_PROTECTED",
+                    {"verified_stop": observed_price, "order_id": sl_orders[0].get("id")},
+                )
+                return observed_price
+
+        pending_restore_phases = {
+            "RESTORE_ACKNOWLEDGED", "RESTORE_STATUS_UNKNOWN",
+            "WAIT_RESTORE_STATUS",
+        }
+        if phase in pending_restore_phases and not sl_orders:
+            resolution = self.resolve_algo_order_by_client_id(
+                symbol, saga.get("restore_client_order_id")
+            )
+            resolution_status = str(resolution.get("status") or "UNKNOWN")
+            if resolution_status == "FOUND":
+                restored_order = resolution.get("order") or {}
+                restored_price = self._order_trigger_price(restored_order) or old_stop
+                if self._stop_prices_equal(restored_price, old_stop):
+                    _archive(
+                        "RESTORED_OLD",
+                        {"verified_stop": restored_price, "order_id": restored_order.get("id")},
+                    )
+                    return restored_price
+                _transition(
+                    "BLOCKED_STOP_MISMATCH",
+                    {"observed_stop": restored_price, "requested_stop": old_stop},
+                )
+                return False
+            if resolution_status == "UNKNOWN":
+                _transition(
+                    "RESTORE_STATUS_UNKNOWN",
+                    {"last_error": resolution.get("reason"), "retry_after": time.time() + 15},
+                )
+                return False
+            return _emergency_close("RESTORE_NOT_FOUND")
+
         if len(sl_orders) == 1:
             observed_price = self._order_trigger_price(sl_orders[0])
             if (
@@ -1494,29 +1852,7 @@ class ExchangeClient:
                         "order_id": sl_orders[0].get("id"),
                     },
                 )
-                return False
-            if self._stop_is_at_least_as_protective(side, observed_price, new_stop):
-                meta = state_manager.get_entry_metadata(symbol) or {}
-                if meta:
-                    meta["current_sl"] = observed_price
-                    meta["sl"] = observed_price
-                    meta["sl_order_id"] = sl_orders[0].get("id")
-                    if not state_manager.save_entry_metadata(symbol, meta):
-                        _transition(
-                            "NEW_VERIFIED_STATE_PENDING",
-                            {"verified_stop": observed_price, "retry_after": time.time() + 5},
-                        )
-                        return False
-                if not _archive(
-                    "NEW_VERIFIED",
-                    {
-                        "verified_stop": observed_price,
-                        "order_id": sl_orders[0].get("id"),
-                    },
-                ):
-                    return False
                 return observed_price
-
             # Persist the dangerous transition before the first cancel call.
             if not _transition(
                 "CANCEL_IN_PROGRESS",
@@ -1529,6 +1865,13 @@ class ExchangeClient:
             try:
                 self._cancel_protection_order(symbol, sl_orders[0])
             except Exception as exc:
+                self._set_protection_replacement_failure(
+                    symbol=symbol, side=side, amount=amount,
+                    current_algo_id=sl_orders[0].get("id"),
+                    old_sl=observed_price, requested_sl=new_stop,
+                    reason="OLD_SL_CANCEL_FAILED", error=exc,
+                    retry_count=int(saga.get("retry_count") or 0),
+                )
                 _transition(
                     "CANCEL_STATUS_UNKNOWN",
                     {"last_error": str(exc), "retry_after": time.time() + 10},
@@ -1546,14 +1889,25 @@ class ExchangeClient:
 
         if not _transition("OLD_ABSENT"):
             return False
-        submission = self._submit_or_resolve_protection(
-            symbol,
-            side,
-            "STOP_MARKET",
-            new_stop,
-            saga.get("new_client_order_id"),
+        submission = (
+            {"status": "FAILED_DEFINITIVE", "reason": "PRIOR_POST_NOT_FOUND"}
+            if pending_new_resolution is not None
+            else self._submit_or_resolve_protection(
+                symbol,
+                side,
+                "STOP_MARKET",
+                new_stop,
+                saga.get("new_client_order_id"),
+            )
         )
         if submission["status"] == "UNKNOWN":
+            self._set_protection_replacement_failure(
+                symbol=symbol, side=side, amount=amount,
+                old_sl=old_stop, requested_sl=new_stop,
+                reason="NEW_SL_STATUS_UNKNOWN",
+                error=RuntimeError(submission.get("error") or submission.get("reason") or "unknown"),
+                retry_count=int(saga.get("retry_count") or 0),
+            )
             _transition(
                 "NEW_STATUS_UNKNOWN",
                 {"last_error": submission.get("error"), "retry_after": time.time() + 15},
@@ -1571,6 +1925,13 @@ class ExchangeClient:
             return False
 
         if old_stop > 0:
+            self._set_protection_replacement_failure(
+                symbol=symbol, side=side, amount=amount,
+                old_sl=old_stop, requested_sl=new_stop,
+                reason="NEW_SL_DEFINITIVE_FAILURE",
+                error=RuntimeError(submission.get("error") or submission.get("reason") or "failed"),
+                retry_count=int(saga.get("retry_count") or 0),
+            )
             restore = self._submit_or_resolve_protection(
                 symbol,
                 side,
@@ -1594,12 +1955,7 @@ class ExchangeClient:
                 )
                 return False
 
-        _transition("EMERGENCY_CLOSE_REQUESTED")
-        logger.critical(
-            f"[{symbol}] تعذر إنشاء SL الجديد واستعادة القديم؛ إرسال إغلاق طوارئ durable."
-        )
-        self.close_position(symbol, side, amount)
-        return False
+        return _emergency_close("NEW_AND_RESTORE_FAILED")
 
     def recover_pending_protection_replacements(self):
         """Resume all persisted replacements; returns a fail-closed summary."""
@@ -1684,6 +2040,60 @@ class ExchangeClient:
             return False
         return self.recover_sl_replacement(symbol, saga=saga)
 
+    def replace_sl_order_state(self, symbol, side, amount, sl_price):
+        """Return an explicit state for one protection replacement request.
+
+        ``replace_sl_order`` historically returned ``False`` both for a
+        definitive failure and for a durable saga that had merely reached
+        ``NEW_ACKNOWLEDGED`` and was waiting for a fresh exchange snapshot.
+        Callers therefore counted safe asynchronous progress as failure and
+        could freeze their local trailing state while Binance later confirmed
+        the new stop.  This adapter preserves the legacy method for external
+        callers while giving runtime managers a non-ambiguous contract.
+        """
+        normalized = self.normalize_price(symbol, sl_price)
+        if normalized is None:
+            return {
+                "state": "FAILED", "confirmed_stop": None,
+                "requested_stop": sl_price, "reason": "INVALID_PRICE_PRECISION",
+            }
+        raw = self.replace_sl_order(symbol, side, amount, normalized)
+        if raw:
+            confirmed = float(raw)
+            state = "CONFIRMED" if self._stop_prices_equal(confirmed, normalized) else "NOOP_PROTECTED"
+            return {
+                "state": state, "confirmed_stop": confirmed,
+                "requested_stop": normalized, "reason": None,
+            }
+
+        state_manager = getattr(self, "_state_manager", None)
+        position_side = "LONG" if str(side).lower() == "buy" else "SHORT"
+        saga = (
+            state_manager.get_protection_replacement(symbol, position_side)
+            if state_manager is not None else None
+        )
+        if isinstance(saga, dict) and saga:
+            phase = str(saga.get("phase") or "UNKNOWN")
+            failed_phases = {
+                "BLOCKED_MULTIPLE_STOPS", "EMERGENCY_CLOSE_REQUESTED",
+                "UNPROTECTED_CRITICAL", "BLOCKED_STOP_MISMATCH",
+            }
+            return {
+                "state": "FAILED" if phase in failed_phases else "PENDING_VERIFICATION",
+                "confirmed_stop": None,
+                "requested_stop": normalized,
+                "reason": phase,
+                "retry_after": saga.get("retry_after"),
+                "saga_id": saga.get("replacement_id") or saga.get("id"),
+            }
+
+        failure = getattr(self, "last_protection_replacement_failure", None) or {}
+        return {
+            "state": "FAILED", "confirmed_stop": None,
+            "requested_stop": normalized,
+            "reason": failure.get("reason") or "NO_DURABLE_SAGA_AND_NOT_CONFIRMED",
+        }
+
     def replace_sl_order(self, symbol, side, amount, sl_price):
         """
         يستبدل SL تسلسلياً وفق قيد Binance لأوامر closePosition.
@@ -1693,6 +2103,7 @@ class ExchangeClient:
         السابق مباشرة. قفل لكل رمز وbackoff يمنعان Trailing وStepTrail من
         إرسال آلاف الطلبات المتعارضة.
         """
+        self.last_protection_replacement_failure = None
         normalized_price = self.normalize_price(symbol, sl_price)
         if normalized_price is None:
             return False
