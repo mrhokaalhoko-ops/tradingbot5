@@ -1,9 +1,12 @@
 import time
+import copy
 from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 from core.config import Config
 from core.logger import logger
+from strategy.strategy_v2_evidence import build_management_shadow_record
+from strategy.strategy_v2_shadow_storage import get_shadow_evidence_store
 
 class TrailingStopManager:
     """
@@ -56,6 +59,90 @@ class TrailingStopManager:
             )
         except Exception as exc:
             logger.debug(f"[Trailing] تعذر تسجيل audit لـ {symbol}: {exc}")
+
+    @staticmethod
+    def _shadow_confirmed_swing_record(df, side, left=3, right=3):
+        """Build timestamped structure evidence without touching V1 state."""
+        if df is None or len(df) < left + right + 5:
+            return None
+        max_i = len(df) - right - 1
+        values = df["low"].values if side == "buy" else df["high"].values
+        records = []
+        for index in range(left, max_i):
+            center = values[index]
+            if side == "buy":
+                confirmed = (
+                    center < np.min(values[index-left:index])
+                    and center < np.min(values[index+1:index+1+right])
+                )
+                event = "CONFIRMED_SWING_LOW"
+            else:
+                confirmed = (
+                    center > np.max(values[index-left:index])
+                    and center > np.max(values[index+1:index+1+right])
+                )
+                event = "CONFIRMED_SWING_HIGH"
+            if not confirmed:
+                continue
+            confirmation_index = index + right
+            if "timestamp" in df.columns:
+                raw_time = df.iloc[confirmation_index]["timestamp"]
+            else:
+                raw_time = df.index[confirmation_index]
+            formatter = getattr(raw_time, "isoformat", None)
+            confirmed_at = formatter() if callable(formatter) else str(raw_time)
+            records.append({
+                "price": float(center),
+                "pivot_index": int(index),
+                "confirmed_at": confirmed_at,
+                "event": event,
+            })
+        return records[-1] if records else None
+
+    def _record_v2_management_shadow(self, symbol, trade, *, client, best_r):
+        """Collect a counterfactual using copied inputs; never mutate V1."""
+        if not self._state_manager:
+            return False
+        bars_df = client.fetch_ohlcv(symbol, timeframe="15m", limit=50)
+        if bars_df is None or len(bars_df) < 20:
+            return False
+        trade_snapshot = copy.deepcopy(trade)
+        meta = self._state_manager.get_entry_metadata(symbol) or {}
+        trade_id = str(meta.get("trade_id") or meta.get("position_id") or symbol)
+        store = get_shadow_evidence_store(
+            Config.STRATEGY_V2_SHADOW_DIR,
+            max_bytes=Config.STRATEGY_V2_SHADOW_MAX_BYTES,
+        )
+        previous = store.get_latest_strategy_v2_management_shadow(trade_id)
+        latest_time = (
+            bars_df.iloc[-1]["timestamp"]
+            if "timestamp" in bars_df.columns else bars_df.index[-1]
+        )
+        formatter = getattr(latest_time, "isoformat", None)
+        observed_at = formatter() if callable(formatter) else str(latest_time)
+        record = build_management_shadow_record(
+            symbol=symbol,
+            trade_id=trade_id,
+            side=trade_snapshot["side"],
+            entry=float(trade_snapshot["entry"]),
+            initial_stop=float(
+                trade_snapshot.get("initial_sl") or trade_snapshot.get("current_sl")
+            ),
+            current_v1_stop=float(
+                trade_snapshot.get("current_sl") or trade_snapshot.get("initial_sl")
+            ),
+            best_price=float(trade_snapshot.get("best_price") or trade_snapshot["entry"]),
+            atr=float(self.calculate_atr(bars_df)),
+            tick_size=float(client.get_price_tick_size(symbol) or 0.0),
+            confirmed_structure=self._shadow_confirmed_swing_record(
+                bars_df, trade_snapshot["side"]
+            ),
+            observed_at=observed_at,
+            last_structure_at=previous.get("structure_confirmed_at"),
+            activation_r=float(getattr(Config, "TRADE_MANAGEMENT_V2_ACTIVATION_R", 1.5)),
+        )
+        saved = store.append_strategy_v2_management_shadow(trade_id, record)
+        return bool(saved)
 
     def register_trade(
         self,
@@ -281,6 +368,18 @@ class TrailingStopManager:
             float(getattr(Config, "TRADE_MANAGEMENT_V2_ACTIVATION_R", 1.5))
             if v2_enabled else self.break_even_at_r
         )
+
+        if getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+            try:
+                self._record_v2_management_shadow(
+                    symbol, trade, client=client, best_r=best_r
+                )
+            except Exception as shadow_error:
+                self._audit(
+                    symbol,
+                    "SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+                    {"error_type": type(shadow_error).__name__},
+                )
 
         # V2 waits for meaningful progress; V1 preserves reviewed rollback.
         if best_r < activation_r:

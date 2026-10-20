@@ -63,6 +63,21 @@ class Config:
     TRADE_MANAGEMENT_V2_ENABLED = os.getenv(
         "TRADE_MANAGEMENT_V2_ENABLED", "false"
     ).strip().lower() in ("true", "1", "yes")
+    # Observation-only Strategy V2 evidence.  This flag cannot authorize or
+    # veto a V1 action; it only appends to a separate bounded SQLite store.
+    STRATEGY_V2_SHADOW_EVIDENCE_ENABLED = os.getenv(
+        "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    STRATEGY_V2_SHADOW_DIR = os.getenv(
+        "STRATEGY_V2_SHADOW_DIR",
+        os.path.join(
+            os.getenv("DATA_DIR", "." if os.name == "nt" else "/app/data"),
+            "strategy_v2_shadow",
+        ),
+    )
+    STRATEGY_V2_SHADOW_MAX_BYTES = int(os.getenv(
+        "STRATEGY_V2_SHADOW_MAX_BYTES", str(128 * 1024 * 1024)
+    ))
     PROTECTION_NOTIFICATION_DEDUP_ENABLED = os.getenv(
         "PROTECTION_NOTIFICATION_DEDUP_ENABLED", "true"
     ).strip().lower() in ("true", "1", "yes")

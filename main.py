@@ -16,6 +16,12 @@ from engines.social_engine import SocialEngine
 from strategy.hybrid_logic import HybridStrategy
 from strategy.risk_manager import RiskManager, entry_sizing_balances
 from strategy.trailing_stop import TrailingStopManager
+from strategy.strategy_v2_evidence import (
+    collect_authoritative_proposal_evidence,
+    collect_closed_outcome_evidence,
+    collect_post_exit_checkpoint,
+)
+from strategy.strategy_v2_shadow_storage import get_shadow_evidence_store
 from strategy.alert_manager import TradeApproachAlertManager
 from strategy.entry_confirmation import (
     build_setup_thesis_id,
@@ -80,6 +86,40 @@ CLOSE_ALREADY_PROCESSING = "ALREADY_PROCESSING"
 CLOSE_PERSIST_RETRY_BASE_SECONDS = 60
 CLOSE_PERSIST_RETRY_MAX_SECONDS = 15 * 60
 CLOSE_PERSIST_NOTIFICATION_INTERVAL_SECONDS = 60 * 60
+
+
+def _strategy_v2_shadow_store():
+    """Lazily open the isolated research store only when the flag is enabled."""
+    return get_shadow_evidence_store(
+        Config.STRATEGY_V2_SHADOW_DIR,
+        max_bytes=Config.STRATEGY_V2_SHADOW_MAX_BYTES,
+    )
+
+
+def _collect_strategy_v2_proposal_shadow(*, proposal, coin_data, audit_ids):
+    """Best-effort observation hook; its result never participates in V1."""
+    if not getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+        return False
+    try:
+        collect_authoritative_proposal_evidence(
+            storage=_strategy_v2_shadow_store(),
+            proposal=proposal,
+            coin_data=coin_data,
+            reset_evidence=_thesis_reset_evidence(
+                coin_data.get("_ta_context") or {}
+            ),
+            audit_ids=audit_ids,
+        )
+        return True
+    except Exception as shadow_error:
+        audit_decision_event(
+            **audit_ids,
+            stage="STRATEGY_V2_SHADOW_DECISION",
+            status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+            details={"error_type": type(shadow_error).__name__},
+            durable=True,
+        )
+        return False
 
 
 def _market_regime_label(value):
@@ -1161,6 +1201,9 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
             target_plan=target_plan,
         )
         coin_data["user_visible_trade_proposal"] = proposal
+        _collect_strategy_v2_proposal_shadow(
+            proposal=proposal, coin_data=coin_data, audit_ids=audit_ids
+        )
 
     # تعطيل إرسال أوامر Demo لا يعطّل تحليل السوق أو عرض الاقتراحات. ننشر
     # الاقتراح النهائي بعد اكتمال جميع فحوص الاستراتيجية/المخاطر، ثم نتوقف
@@ -2309,6 +2352,22 @@ def monitor_post_exit_observations(client, state_manager, now=None):
                         stage="POST_EXIT_MFE", status=label.upper(),
                         details=checkpoints[label], durable=True,
                     )
+                    if getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+                        try:
+                            collect_post_exit_checkpoint(
+                                storage=_strategy_v2_shadow_store(),
+                                trade_id=str(item.get("trade_id") or ""),
+                                horizon=label,
+                                checkpoint=checkpoints[label],
+                            )
+                        except Exception as shadow_error:
+                            audit_decision_event(
+                                symbol=item.get("symbol"),
+                                trade_id=item.get("trade_id"),
+                                stage="STRATEGY_V2_SHADOW_OUTCOME",
+                                status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+                                details={"error_type": type(shadow_error).__name__},
+                            )
             if item.get("is_stop_exit"):
                 achieved = [
                     level for level in STOP_THEN_RUN_THRESHOLDS_R
@@ -2653,6 +2712,55 @@ def _handle_trade_close_inner(alert, state_manager, client, symbol, notifier=Non
     )
 
     proposal = entry_meta.get("user_visible_trade_proposal") or {}
+    if proposal and getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+        try:
+            shadow_store = _strategy_v2_shadow_store()
+            collect_closed_outcome_evidence(
+                storage=shadow_store,
+                proposal_id=str(
+                    proposal.get("proposal_id") or entry_meta.get("trade_id") or ""
+                ),
+                trade_id=str(entry_meta.get("trade_id") or ""),
+                symbol=symbol,
+                exit_details=exit_details,
+                audit_ids={
+                    "scan_id": decision_context.get("scan_id") or entry_meta.get("scan_id"),
+                    "decision_id": decision_context.get("decision_id") or entry_meta.get("decision_id"),
+                    "signal_id": decision_context.get("decision_id") or entry_meta.get("decision_id"),
+                    "setup_id": entry_meta.get("setup_thesis_id"),
+                    "thesis_id": entry_meta.get("setup_thesis_id"),
+                    "position_id": entry_meta.get("position_id") or entry_meta.get("trade_id"),
+                    "trade_id": entry_meta.get("trade_id"),
+                    "symbol": symbol,
+                },
+            )
+            thesis_id = entry_meta.get("setup_thesis_id")
+            if thesis_id:
+                shadow_store.record_closed_thesis(
+                    symbol,
+                    str(thesis_id),
+                    side=str(entry_meta.get("side") or ""),
+                    closed_at=str(
+                        exit_details.get("exit_time")
+                        or alert.get("closed_at")
+                        or alert.get("timestamp")
+                        or datetime.now(timezone.utc).isoformat()
+                    ),
+                    details={
+                        "trade_id": entry_meta.get("trade_id"),
+                        "pnl": pnl_val,
+                        "close_type": close_type,
+                    },
+                )
+        except Exception as shadow_error:
+            audit_decision_event(
+                symbol=symbol,
+                trade_id=entry_meta.get("trade_id"),
+                stage="STRATEGY_V2_SHADOW_OUTCOME",
+                status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+                details={"error_type": type(shadow_error).__name__},
+                durable=True,
+            )
     if proposal:
         _proposal_ledger_update(
             state_manager,
@@ -3367,8 +3475,40 @@ def build_entry_ta_context(ta_details: dict) -> dict:
         },
         "recent_sell_side_sweep": bool(details.get("recent_sell_side_sweep", False)),
         "recent_buy_side_sweep": bool(details.get("recent_buy_side_sweep", False)),
+        "bos_created_at": str(details.get("bos_created_at") or ""),
+        "choch_created_at": str(details.get("choch_created_at") or ""),
+        "liquidity_sweep_at": str(details.get("liquidity_sweep_at") or ""),
+        "entry_zone_created_at": str(details.get("entry_zone_created_at") or ""),
+        "htf_context_changed_at": str(details.get("htf_context_changed_at") or ""),
         "setup_anchor": safe_anchor,
     }
+
+
+def _thesis_reset_evidence(ta_context: dict) -> list[dict]:
+    """Expose only timestamps already carried by V1; never invent evidence."""
+    context = ta_context or {}
+    evidence = []
+    anchor = context.get("setup_anchor") or {}
+    if anchor.get("created_at"):
+        evidence.append({
+            "event": "NEW_ORDER_BLOCK",
+            "timestamp": anchor["created_at"],
+            "source": "setup_anchor.created_at",
+        })
+    for field, event in (
+        ("bos_created_at", "NEW_BOS"),
+        ("choch_created_at", "NEW_CHOCH"),
+        ("liquidity_sweep_at", "NEW_LIQUIDITY_SWEEP"),
+        ("entry_zone_created_at", "NEW_ENTRY_ZONE"),
+        ("htf_context_changed_at", "MATERIAL_HTF_CONTEXT_CHANGE"),
+    ):
+        if context.get(field):
+            evidence.append({
+                "event": event,
+                "timestamp": context[field],
+                "source": field,
+            })
+    return evidence
 
 
 def run_bot_iteration(client, hybrid_strategy, risk_manager, trailing_manager, state_manager, notifier, news_engine, ai_engine, ta_engine, social_engine, universe_filter, derivatives_filter, active_strategies, last_scan_time=None):
@@ -3941,6 +4081,16 @@ def run_bot_iteration(client, hybrid_strategy, risk_manager, trailing_manager, s
             'analysis_side_source': 'HTF_1H_AND_15M_EMA_OBSERVATION' if analysis_side else None,
             'context_1h': analysis_context_1h,
         }
+        if getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+            closed_15m_at = _closed_bar_end_utc(latest, 15)
+            coin_data["_strategy_v2_shadow_sources"] = {
+                "15m": {
+                    "confirmed_at": (
+                        closed_15m_at.isoformat() if closed_15m_at else ""
+                    ),
+                    "source": "run_bot_iteration.closed_15m_bar",
+                }
+            }
         audit_decision_event(
             scan_id=scan_id,
             decision_id=decision_id,
