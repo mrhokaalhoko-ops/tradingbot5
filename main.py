@@ -8322,6 +8322,12 @@ def validate_telegram_proposal_demo_mode():
     }
 
 
+def _release_writer_lease(writer_lease):
+    """Release the optional mutation lease during active or passive shutdown."""
+    if writer_lease is not None:
+        writer_lease.release()
+
+
 def main():
     # يجب أن يسبق هذا الحارس ExchangeClient وWebSocket وأي خيط خلفي. وجوده
     # لاحقاً فقط يمنع الأوامر، لكنه يسمح ببدء اتصالات LIVE قبل رفض البيئة.
@@ -8755,7 +8761,7 @@ def main():
             close_forensics_db()
         except Exception as exc:
             logger.warning(f"[Shutdown] تعذر إغلاق اتصال قاعدة بيانات: {exc}")
-        writer_lease.release()
+        _release_writer_lease(writer_lease)
         record_run_end(_shutdown_reason)
         mark_graceful_shutdown(_shutdown_reason)
         stop_resource_monitor()

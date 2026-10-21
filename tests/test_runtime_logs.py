@@ -523,6 +523,20 @@ class TestLogSecretRedaction(unittest.TestCase):
         self.assertNotIn("SUPERSECRETTOKEN123456789", safe)
         self.assertIn("ABCD****", safe)
 
+    def test_demo_binance_credentials_are_redacted_even_without_labels(self):
+        demo_key = "DEMO1234567890UNLABELLEDKEY"
+        demo_secret = "SECR1234567890UNLABELLEDSECRET"
+        with patch.dict(os.environ, {
+            "BINANCE_DEMO_API_KEY": demo_key,
+            "BINANCE_DEMO_API_SECRET": demo_secret,
+        }, clear=False):
+            safe = redact_secrets(f"{demo_key} {demo_secret}")
+
+        self.assertNotIn(demo_key, safe)
+        self.assertNotIn(demo_secret, safe)
+        self.assertIn("DEMO****", safe)
+        self.assertIn("SECR****", safe)
+
 
 class TestRuntimeLogTelegramAuthorization(unittest.TestCase):
     def test_unauthorized_callback_is_rejected_before_export(self):

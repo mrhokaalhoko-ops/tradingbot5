@@ -728,14 +728,17 @@ class ExchangeClient:
     def _fetch_position_protection_orders(self, symbol, position_side=None):
         """جلب أوامر الحماية مع تمييز الفشل عن نتيجة فارغة.
 
-        واجهة Algo هي المصدر الأساسي لأوامر Binance الشرطية الجديدة، ثم ندمج
-        نتيجة CCXT للتوافق مع الإصدارات والحسابات القديمة.
+        لا تكون النتيجة كاملة إلا بعد نجاح مصدر Algo ومصدر الأوامر العادية.
+        قد تكون الحماية موزعة بين المصدرين أثناء migration/recovery، لذلك لا
+        يجوز اعتبار نجاح أحدهما دليلاً على عدم وجود أوامر في الآخر.
         """
         requested_side = str(position_side or "").upper()
         orders = []
         seen = set()
-        successful_fetches = 0
         algo_fetch_succeeded = False
+        regular_fetch_succeeded = False
+        legacy_stop_fetch_succeeded = False
+        source_errors = {}
 
         try:
             market = self.exchange.market(symbol)
@@ -743,27 +746,45 @@ class ExchangeClient:
                 "symbol": market["id"],
             })
             if isinstance(raw_orders, list):
-                successful_fetches += 1
                 algo_fetch_succeeded = True
                 for raw in raw_orders:
                     order = self._normalize_algo_order(raw)
                     if order:
                         orders.append(order)
+            else:
+                source_errors["algo"] = "NON_LIST_RESPONSE"
         except Exception as exc:
             logger.warning(f"[{symbol}] تعذر جلب أوامر Algo المفتوحة: {exc}")
+            source_errors["algo"] = f"{type(exc).__name__}:{exc}"
 
-        # إذا أعادت Algo أوامر فعلية فهي المصدر الكامل للحماية الجديدة. عند
-        # النتيجة الفارغة نفحص CCXT أيضاً لالتقاط أوامر legacy قديمة.
-        legacy_queries = () if algo_fetch_succeeded and orders else ({"stop": True}, {})
-        for params in legacy_queries:
-            try:
-                fetched = self.exchange.fetch_open_orders(symbol, params=params)
-                if not isinstance(fetched, list):
-                    continue
-                successful_fetches += 1
+        # الاستعلام العام إلزامي حتى عند وجود أوامر Algo، لأنه قد يحتوي أوامر
+        # عادية/قديمة لن تظهر في Algo API. استعلام stop القديم best-effort فقط
+        # للتوافق مع حسابات ونسخ CCXT الأقدم.
+        try:
+            fetched = self.exchange.fetch_open_orders(symbol, params={})
+            if isinstance(fetched, list):
+                regular_fetch_succeeded = True
                 orders.extend(fetched)
-            except Exception as exc:
-                logger.debug(f"[{symbol}] فشل مسار جلب أوامر الحماية {params}: {exc}")
+            else:
+                source_errors["regular"] = "NON_LIST_RESPONSE"
+        except Exception as exc:
+            logger.warning(f"[{symbol}] تعذر جلب الأوامر العادية المفتوحة: {exc}")
+            source_errors["regular"] = f"{type(exc).__name__}:{exc}"
+
+        try:
+            fetched = self.exchange.fetch_open_orders(symbol, params={"stop": True})
+            if isinstance(fetched, list):
+                legacy_stop_fetch_succeeded = True
+                orders.extend(fetched)
+            else:
+                source_errors["legacy_stop"] = "NON_LIST_RESPONSE"
+        except Exception as exc:
+            # Binance الحديثة قد ترفض هذا المسار بعد نقل conditional orders
+            # إلى Algo API؛ لذلك لا يؤثر فشله على اكتمال المصدرين authoritative.
+            source_errors["legacy_stop"] = f"{type(exc).__name__}:{exc}"
+            logger.debug(f"[{symbol}] فشل مسار legacy stop: {exc}")
+
+        complete = algo_fetch_succeeded and regular_fetch_succeeded
 
         filtered = []
         for order in orders:
@@ -788,7 +809,14 @@ class ExchangeClient:
             filtered.append(order)
 
         return {
-            "status": "OK" if successful_fetches else "UNKNOWN",
+            "status": "OK" if complete else "UNKNOWN",
+            "complete": complete,
+            "source_status": {
+                "algo": "OK" if algo_fetch_succeeded else "UNKNOWN",
+                "regular": "OK" if regular_fetch_succeeded else "UNKNOWN",
+                "legacy_stop": "OK" if legacy_stop_fetch_succeeded else "OPTIONAL_UNKNOWN",
+            },
+            "source_errors": source_errors,
             "orders": filtered,
             "sl_orders": [o for o in filtered if self._is_stop_market_order(o)],
             "tp_orders": [

@@ -125,7 +125,16 @@ class FakeClient:
 
     def create_reduce_only_market_exit(self, symbol, quantity, client_id):
         self.exit_calls.append((symbol, quantity, client_id))
-        return {"orderId": "exit-1", "status": "FILLED", "avgPrice": "100"}
+        order = {
+            "orderId": "exit-1",
+            "clientOrderId": client_id,
+            "status": "FILLED",
+            "executedQty": quantity,
+            "avgPrice": "100",
+        }
+        self.query_results["exit-1"] = order
+        self.query_results[client_id] = order
+        return dict(order)
 
     def query_order(self, symbol, *, order_id=None, client_id=None):
         key = str(order_id or client_id)
@@ -274,6 +283,16 @@ def executor(tmp_path, client=None):
     return item, store
 
 
+def execute(item, snapshot, exchange_filter=None, **kwargs):
+    """Exercise the real executor with an explicitly observed Demo quote."""
+    kwargs.setdefault("execution_quote", demo_quote(snapshot))
+    return item.execute_candidate(
+        snapshot,
+        exchange_filter or filters(),
+        **kwargs,
+    )
+
+
 def test_demo_endpoint_guard_accepts_only_demo_or_testnet():
     proof = DemoEndpointGuard.validate("https://demo-fapi.binance.com")
     assert proof["is_demo_or_testnet"] is True
@@ -408,7 +427,7 @@ def test_execution_is_impossible_when_global_switch_is_false(tmp_path):
     )
     assert item.startup()["status"] == "DISABLED"
     with pytest.raises(Exception, match="DEMO_EXECUTION_DISABLED"):
-        item.execute_candidate(synthetic_snapshot(), filters())
+        execute(item, synthetic_snapshot())
     assert fake.entry_calls == []
     store.close()
 
@@ -418,8 +437,8 @@ def test_duplicate_candidate_never_duplicates_orders(tmp_path):
     item, store = executor(tmp_path, fake)
     assert item.startup()["status"] == "READY"
     snapshot = synthetic_snapshot()
-    first = item.execute_candidate(snapshot, filters())
-    second = item.execute_candidate(snapshot, filters())
+    first = execute(item, snapshot)
+    second = execute(item, snapshot)
     assert first["state"] == "PROTECTED"
     assert second["status"] == "DUPLICATE_CANDIDATE"
     assert len(fake.entry_calls) == 1
@@ -427,11 +446,61 @@ def test_duplicate_candidate_never_duplicates_orders(tmp_path):
     store.close()
 
 
+def test_missing_explicit_execution_quote_fails_closed_before_account_or_order(tmp_path):
+    fake = FakeClient()
+    item, store = executor(tmp_path, fake)
+    assert item.startup()["status"] == "READY"
+    snapshot = synthetic_snapshot()
+
+    result = item.execute_candidate(snapshot, filters())
+
+    assert result["state"] == "SKIPPED_EXECUTION_QUOTE_UNAVAILABLE"
+    assert result["payload"]["snapshot_quote_reused"] is False
+    assert fake.account_calls == 0
+    assert fake.leverage_calls == []
+    assert fake.entry_calls == []
+    store.close()
+
+
+def test_distinct_candidate_for_same_local_active_symbol_is_rejected(tmp_path):
+    fake = FakeClient()
+    item, store = executor(tmp_path, fake)
+    assert item.startup()["status"] == "READY"
+    existing = synthetic_snapshot()
+    store.claim_candidate("existing-candidate", existing.symbol, {})
+    store.update("existing-candidate", "PROTECTED")
+    new_snapshot = replace(
+        existing,
+        candidate=replace(existing.candidate, candidate_id="new-candidate"),
+    )
+
+    result = execute(item, new_snapshot)
+
+    assert result["state"] == "SKIPPED_SYMBOL_ACTIVE"
+    assert result["payload"]["symbol_guard_source"] == "LOCAL_ACTIVE_LIFECYCLE"
+    assert fake.entry_calls == []
+    store.close()
+
+
+def test_distinct_candidate_for_same_exchange_symbol_is_rejected(tmp_path):
+    fake = FakeClient()
+    item, store = executor(tmp_path, fake)
+    assert item.startup()["status"] == "READY"
+    fake.positions = [{"symbol": "FIXTUREUSDT", "positionAmt": "0.2"}]
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "SKIPPED_SYMBOL_ACTIVE"
+    assert result["payload"]["symbol_guard_source"] == "EXCHANGE_OPEN_POSITION"
+    assert fake.entry_calls == []
+    store.close()
+
+
 def test_entry_fill_then_stop_and_take_profit_are_created(tmp_path):
     fake = FakeClient()
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "PROTECTED"
     assert result["payload"]["filled_qty"] == pytest.approx(0.2)
     assert [row[3] for row in fake.protective_calls] == [
@@ -468,7 +537,7 @@ def test_ambiguous_algo_submission_queries_same_client_id_without_repost(tmp_pat
     fake = AmbiguousProtectionClient()
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "PROTECTED"
     assert len(fake.entry_calls) == 1
     assert [row[3] for row in fake.protective_calls] == [
@@ -501,19 +570,238 @@ def test_unresolved_algo_submission_fails_closed_without_duplicate_post(tmp_path
     item, store = executor(tmp_path, fake)
     item.startup()
     snapshot = synthetic_snapshot()
-    with pytest.raises(DemoBinanceError, match="RETRY_EXHAUSTED"):
-        item.execute_candidate(snapshot, filters())
+    result = execute(item, snapshot)
     failed = store.get(snapshot.candidate.candidate_id)
-    assert failed["state"] == "FAILED_CLOSED"
+    assert result["state"] == "EMERGENCY_EXIT_CLEANUP_PENDING"
+    assert failed["state"] == "EMERGENCY_EXIT_CLEANUP_PENDING"
+    assert failed["payload"]["emergency_position_confirmed_flat"] is True
     assert failed["payload"]["emergency_exit"]["status"] == "FILLED"
     assert "RETRY_EXHAUSTED" in failed["payload"]["protection_failure"]
+    assert failed["payload"]["protection_cleanup_failures"]
     assert len(fake.protective_calls) == 1
     assert len(fake.entry_calls) == 1
     assert len(fake.exit_calls) == 1
-    duplicate = item.execute_candidate(snapshot, filters())
+    duplicate = execute(item, snapshot)
     assert duplicate["status"] == "BLOCKED_RECONCILIATION"
     assert len(fake.protective_calls) == 1
     assert len(fake.entry_calls) == 1
+    store.close()
+
+
+def test_protection_failure_keeps_existing_stop_until_position_is_flat(tmp_path):
+    class PartialProtectionClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def position_risk(self):
+            self.position_risk_calls += 1
+            if self.entry_calls:
+                return [{"symbol": "FIXTUREUSDT", "positionAmt": "0.2"}]
+            return []
+
+        def create_protective(
+            self, symbol, quantity, trigger_price, *, kind, client_id,
+        ):
+            self.events.append(f"protect:{kind}")
+            if kind == "TAKE_PROFIT_MARKET":
+                raise DemoBinanceError("tp unavailable")
+            order = super().create_protective(
+                symbol, quantity, trigger_price, kind=kind, client_id=client_id
+            )
+            self.algo_orders.append(order)
+            return order
+
+        def create_reduce_only_market_exit(self, symbol, quantity, client_id):
+            self.events.append("exit")
+            return super().create_reduce_only_market_exit(symbol, quantity, client_id)
+
+        def cancel_algo_order(self, *, algo_id=None, client_id=None):
+            self.events.append("cancel")
+            return super().cancel_algo_order(algo_id=algo_id, client_id=client_id)
+
+    fake = PartialProtectionClient()
+    item, store = executor(tmp_path, fake)
+    item.startup()
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "EMERGENCY_EXIT_RECONCILIATION"
+    assert result["payload"]["emergency_position_still_open"] is True
+    assert fake.events == [
+        "protect:STOP_MARKET", "protect:TAKE_PROFIT_MARKET", "exit",
+    ]
+    assert fake.algo_cancel_calls == []
+    assert result in store.active()
+    store.close()
+
+
+def test_protection_is_canceled_only_after_emergency_exit_confirms_flat(tmp_path):
+    class FlatAfterExitClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def position_risk(self):
+            self.position_risk_calls += 1
+            if self.entry_calls and not self.exit_calls:
+                return [{"symbol": "FIXTUREUSDT", "positionAmt": "0.2"}]
+            return []
+
+        def create_protective(
+            self, symbol, quantity, trigger_price, *, kind, client_id,
+        ):
+            self.events.append(f"protect:{kind}")
+            if kind == "TAKE_PROFIT_MARKET":
+                raise DemoBinanceError("tp unavailable")
+            order = super().create_protective(
+                symbol, quantity, trigger_price, kind=kind, client_id=client_id
+            )
+            self.algo_orders.append(order)
+            return order
+
+        def create_reduce_only_market_exit(self, symbol, quantity, client_id):
+            self.events.append("exit")
+            return super().create_reduce_only_market_exit(symbol, quantity, client_id)
+
+        def cancel_algo_order(self, *, algo_id=None, client_id=None):
+            self.events.append("cancel")
+            return super().cancel_algo_order(algo_id=algo_id, client_id=client_id)
+
+    fake = FlatAfterExitClient()
+    item, store = executor(tmp_path, fake)
+    item.startup()
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "EMERGENCY_CLOSED_PROTECTION_FAILURE"
+    assert result["payload"]["emergency_position_confirmed_flat"] is True
+    assert fake.events == [
+        "protect:STOP_MARKET", "protect:TAKE_PROFIT_MARKET", "exit", "cancel",
+    ]
+    assert len(fake.exit_calls) == 1
+    assert len(fake.algo_cancel_calls) == 1
+    store.close()
+
+
+def test_ambiguous_emergency_exit_queries_same_order_and_never_reposts(tmp_path):
+    class AmbiguousExitClient(FakeClient):
+        def create_reduce_only_market_exit(self, symbol, quantity, client_id):
+            self.exit_calls.append((symbol, quantity, client_id))
+            self.query_results[client_id] = {
+                "orderId": "exit-recovered",
+                "clientOrderId": client_id,
+                "status": "FILLED",
+                "executedQty": quantity,
+            }
+            raise requests.Timeout("exit outcome unknown")
+
+    fake = AmbiguousExitClient({
+        "orderId": "entry-high-fill", "status": "FILLED",
+        "origQty": "0.2", "executedQty": "0.2", "avgPrice": "101.5",
+    })
+    item, store = executor(tmp_path, fake)
+    item.startup()
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "CLOSED_POST_FILL_RR_REJECTED"
+    assert result["payload"]["emergency_position_confirmed_flat"] is True
+    assert result["payload"]["emergency_exit_post_retried"] is False
+    assert len(fake.exit_calls) == 1
+    exit_client_id = fake.exit_calls[0][2]
+    assert any(call[2] == exit_client_id for call in fake.query_calls)
+    store.close()
+
+
+def test_successful_emergency_exit_response_without_quantity_is_queried(tmp_path):
+    class IncompleteExitResponseClient(FakeClient):
+        def create_reduce_only_market_exit(self, symbol, quantity, client_id):
+            self.exit_calls.append((symbol, quantity, client_id))
+            recovered = {
+                "orderId": "exit-query-required",
+                "clientOrderId": client_id,
+                "status": "FILLED",
+                "executedQty": quantity,
+            }
+            self.query_results["exit-query-required"] = recovered
+            self.query_results[client_id] = recovered
+            return {
+                "orderId": "exit-query-required",
+                "clientOrderId": client_id,
+                "status": "FILLED",
+            }
+
+    fake = IncompleteExitResponseClient({
+        "orderId": "entry-high-fill", "status": "FILLED",
+        "origQty": "0.2", "executedQty": "0.2", "avgPrice": "101.5",
+    })
+    item, store = executor(tmp_path, fake)
+    item.startup()
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "CLOSED_POST_FILL_RR_REJECTED"
+    assert result["payload"]["emergency_exit_confirmed"] is True
+    assert result["payload"]["emergency_exit_executed_qty"] == pytest.approx(0.2)
+    assert len(fake.exit_calls) == 1
+    assert any(call[1] == "exit-query-required" for call in fake.query_calls)
+    store.close()
+
+
+def test_unresolved_emergency_exit_remains_active_and_reconciliation_blocked(tmp_path):
+    class UnresolvedExitClient(FakeClient):
+        def __init__(self, entry_response):
+            super().__init__(entry_response)
+            self.exit_query_failures_remaining = 1
+
+        def create_reduce_only_market_exit(self, symbol, quantity, client_id):
+            self.exit_calls.append((symbol, quantity, client_id))
+            recovered = {
+                "orderId": "exit-recovered-after-restart",
+                "clientOrderId": client_id,
+                "status": "FILLED",
+                "executedQty": quantity,
+            }
+            self.query_results["exit-recovered-after-restart"] = recovered
+            self.query_results[client_id] = recovered
+            raise requests.Timeout("exit outcome unknown")
+
+        def query_order(self, symbol, *, order_id=None, client_id=None):
+            self.query_calls.append(
+                (symbol, str(order_id or ""), str(client_id or ""))
+            )
+            if (
+                client_id
+                and str(client_id).startswith("dbr4-x-")
+                and self.exit_query_failures_remaining > 0
+            ):
+                self.exit_query_failures_remaining -= 1
+                raise DemoBinanceError("exit lookup unavailable", retryable=True)
+            key = str(order_id or client_id)
+            result = self.query_results.get(key, self.entry_response)
+            return dict(result)
+
+    fake = UnresolvedExitClient({
+        "orderId": "entry-high-fill", "status": "FILLED",
+        "origQty": "0.2", "executedQty": "0.2", "avgPrice": "101.5",
+    })
+    item, store = executor(tmp_path, fake)
+    item.startup()
+
+    result = execute(item, synthetic_snapshot())
+
+    assert result["state"] == "EMERGENCY_EXIT_UNKNOWN"
+    assert result["payload"]["emergency_exit_post_retried"] is False
+    assert result in store.active()
+    assert item.reconciliation_ok is False
+    assert len(fake.exit_calls) == 1
+    reconciled = item.reconcile()
+    assert reconciled["ok"] is True
+    assert len(fake.exit_calls) == 1
+    assert store.get(synthetic_snapshot().candidate.candidate_id)["state"] == (
+        "CLOSED_POST_FILL_RR_REJECTED"
+    )
     store.close()
 
 
@@ -528,7 +816,7 @@ def test_filled_response_without_price_is_refreshed_by_get_then_protected(tmp_pa
     }
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "PROTECTED"
     assert result["payload"]["entry_fill"] == pytest.approx(100.0)
     assert len(fake.entry_calls) == 1
@@ -574,7 +862,7 @@ def test_filled_price_get_exhaustion_keeps_active_and_never_reposts(tmp_path):
     )
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "ENTRY_FILLED_UNPRICED"
     assert result["payload"]["filled_qty"] == pytest.approx(0.2)
     assert item.reconciliation_ok is False
@@ -596,7 +884,7 @@ def test_entry_terminal_get_failure_stays_active_and_never_reposts(tmp_path):
     )
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "ENTRY_SUBMITTED"
     assert result["payload"]["reconciliation_required"] is True
     assert result["payload"]["entry_post_retried"] is False
@@ -634,7 +922,7 @@ def test_ambiguous_entry_post_is_reconciled_without_duplicate_post(tmp_path):
     fake = AmbiguousEntryClient()
     item, store = executor(tmp_path, fake)
     item.startup()
-    pending = item.execute_candidate(synthetic_snapshot(), filters())
+    pending = execute(item, synthetic_snapshot())
     assert pending["state"] == "ENTRY_SUBMITTED"
     assert pending["payload"]["entry_submission_ambiguous"] is True
     assert pending["payload"]["reconciliation_required"] is True
@@ -675,7 +963,7 @@ def test_partial_fill_protects_only_filled_quantity(tmp_path):
     }
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "PROTECTED"
     assert result["payload"]["partial_fill"] is True
     assert result["payload"]["filled_qty"] == pytest.approx(0.1)
@@ -691,7 +979,7 @@ def test_rejected_entry_creates_no_protection(tmp_path):
     })
     item, store = executor(tmp_path, fake)
     item.startup()
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "ENTRY_REJECTED"
     assert fake.protective_calls == []
     store.close()
@@ -773,7 +1061,7 @@ def test_reconciliation_recognizes_algo_protection_and_does_not_duplicate(tmp_pa
     item, store = executor(tmp_path, fake)
     item.startup()
     snapshot = synthetic_snapshot()
-    protected = item.execute_candidate(snapshot, filters())
+    protected = execute(item, snapshot)
     fake.positions = [{"symbol": snapshot.symbol, "positionAmt": "0.2"}]
     fake.algo_orders = [
         {
@@ -840,7 +1128,7 @@ def test_exchange_local_position_mismatch_fails_closed(tmp_path):
     assert result["reconciliation"]["mismatches"] == [
         "ORPHAN_EXCHANGE_POSITION:UNKNOWNUSDT"
     ]
-    assert item.execute_candidate(synthetic_snapshot(), filters())["status"] == (
+    assert execute(item, synthetic_snapshot())["status"] == (
         "BLOCKED_RECONCILIATION"
     )
     assert fake.entry_calls == []
@@ -883,7 +1171,7 @@ def test_repeated_reconciliation_timeout_stays_observable_and_fail_closed(tmp_pa
     assert blocked["reconciliation"]["exchange_open_positions"] is None
     assert blocked["reconciliation"]["exchange_open_orders"] is None
     assert blocked["reconciliation"]["retry"]["status"] == "EXHAUSTED"
-    assert item.execute_candidate(synthetic_snapshot(), filters())["status"] == (
+    assert execute(item, synthetic_snapshot())["status"] == (
         "BLOCKED_RECONCILIATION"
     )
     assert all(call[0] == "GET" for call in session.calls)
@@ -958,7 +1246,7 @@ def test_max_ten_positions_blocks_eleventh(tmp_path):
     item, store = executor(tmp_path, fake)
     store.put_meta("first_lifecycle_verified", True)
     item.reconciliation_ok = True
-    result = item.execute_candidate(synthetic_snapshot(), filters())
+    result = execute(item, synthetic_snapshot())
     assert result["state"] == "SKIPPED_CAPACITY"
     assert result["payload"]["effective_position_cap"] == 10
     assert fake.entry_calls == []
@@ -969,7 +1257,7 @@ def test_leverage_is_exactly_five_and_risk_semantics_hold(tmp_path):
     fake = FakeClient()
     item, store = executor(tmp_path, fake)
     item.startup()
-    item.execute_candidate(synthetic_snapshot(), filters())
+    execute(item, synthetic_snapshot())
     assert fake.leverage_calls == [("FIXTUREUSDT", 5)]
     sizing = DemoBExecutor.position_size(
         equity=1000, available_balance=1000, entry=100, stop=99,
@@ -985,7 +1273,7 @@ def test_first_exact_entry_exit_lifecycle_restores_capacity_to_ten(tmp_path):
     item, store = executor(tmp_path, fake)
     item.startup()
     snapshot = synthetic_snapshot()
-    protected = item.execute_candidate(snapshot, filters())
+    protected = execute(item, snapshot)
     assert item.effective_position_cap == 1
     fake.positions = []
     fake.orders = []

@@ -10,6 +10,16 @@ Clean migration repository for the `trversion4` Telegram trading bot.
 - Runtime state belongs on a Railway persistent volume mounted at `/app/data`.
 - Railway starts the service with `python -u main.py` using the included `Dockerfile` and `railway.json`.
 
+### Mainnet safety boundary
+
+The shared codebase retains a deliberately explicit legacy live-trading escape
+hatch for other deployments. It remains blocked unless both
+`USE_TESTNET=false` and the exact `LIVE_TRADING_CONFIRMATION` acknowledgement
+are supplied. That capability is **not authorized for this repository's
+`tradingbot5` Railway service**: its supported runtime contract is
+`USE_TESTNET=true`, Binance Demo endpoints, and `mainnet_order_route=false`.
+Do not set the live acknowledgement in this service.
+
 ## Branches
 
 - `main`: clean rollback/reference snapshot of version `1.6.18`.

@@ -61,6 +61,9 @@ def _verify_telegram_init_data(init_data: str, bot_token: str, expected_user_id=
             sorted(f"{k}={v[0]}" for k, v in parsed.items())
         )
 
+        # Telegram Mini Apps specification: WebAppData is the HMAC key and
+        # the bot token is the message. Reversing these arguments invalidates
+        # legitimate initData signatures.
         secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
         computed   = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(computed, hash_val):

@@ -32,6 +32,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
         client.exchange.price_to_precision.side_effect = lambda _symbol, price: str(price)
         client.exchange.market.return_value = {"id": "BTCUSDT"}
         client.exchange.fapiPrivateGetOpenAlgoOrders.return_value = []
+        client.exchange.fetch_open_orders.return_value = []
         client.exchange.fapiPrivatePostAlgoOrder.side_effect = lambda params: {
             "algoId": f"algo-{params.get('clientAlgoId', 'protection')}",
             "clientAlgoId": params.get("clientAlgoId"),
@@ -42,6 +43,12 @@ class TestExchangeProtectionSafety(unittest.TestCase):
             "positionSide": params.get("positionSide", "BOTH"),
         }
         return client
+
+    def test_passive_shutdown_accepts_missing_writer_lease(self):
+        main_module._release_writer_lease(None)
+        lease = Mock()
+        main_module._release_writer_lease(lease)
+        lease.release.assert_called_once_with()
 
     def test_trade_excursions_use_original_stop_risk(self):
         meta = {
@@ -189,6 +196,60 @@ class TestExchangeProtectionSafety(unittest.TestCase):
             "symbol": "BTCUSDT", "algoId": "algo-old"
         })
         client.exchange.cancel_order.assert_not_called()
+
+    def test_protection_snapshot_is_unknown_when_algo_source_fails(self):
+        client = self._client()
+        client.exchange.fapiPrivateGetOpenAlgoOrders.side_effect = RuntimeError(
+            "algo timeout"
+        )
+        client.exchange.fetch_open_orders.return_value = []
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["source_status"]["algo"], "UNKNOWN")
+        self.assertEqual(result["source_status"]["regular"], "OK")
+
+    def test_protection_snapshot_queries_regular_even_when_algo_has_orders(self):
+        client = self._client()
+        client.exchange.fapiPrivateGetOpenAlgoOrders.return_value = [{
+            "algoId": "algo-stop",
+            "clientAlgoId": "stop-client",
+            "orderType": "STOP_MARKET",
+            "triggerPrice": "98",
+            "algoStatus": "NEW",
+        }]
+        regular_tp = {
+            "id": "regular-tp",
+            "type": "take_profit_market",
+            "info": {"orderType": "TAKE_PROFIT_MARKET", "stopPrice": "105"},
+        }
+        client.exchange.fetch_open_orders.side_effect = [[regular_tp], []]
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(len(result["sl_orders"]), 1)
+        self.assertEqual(len(result["tp_orders"]), 1)
+        self.assertEqual(
+            [call.kwargs["params"] for call in client.exchange.fetch_open_orders.call_args_list],
+            [{}, {"stop": True}],
+        )
+
+    def test_protection_snapshot_is_unknown_when_regular_source_fails(self):
+        client = self._client()
+        client.exchange.fetch_open_orders.side_effect = [
+            RuntimeError("regular timeout"),
+            [],
+        ]
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["source_status"]["algo"], "OK")
+        self.assertEqual(result["source_status"]["regular"], "UNKNOWN")
 
     def test_durable_sl_replacement_recovers_crash_after_cancel_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2492,6 +2553,27 @@ class TestWebAppAuth(unittest.TestCase):
 
         expired = self._signed_data(token, 123, now - 7200)
         self.assertFalse(_verify_telegram_init_data(expired, token, expected_user_id=123, max_age_seconds=3600))
+
+    def test_official_hmac_key_order_vector_and_reversed_formula_rejected(self):
+        token = "123456:ABC-telegram-test-token"
+        valid = (
+            "auth_date=1700000000&query_id=AAEAAAE&"
+            "user=%7B%22id%22%3A42%2C%22first_name%22%3A%22Ada%22%7D&"
+            "hash=2f3ff65369e4f1e23ba8fb5b19134dcf6719dd583552700025629bfd3364275b"
+        )
+        reversed_formula = valid.rsplit("=", 1)[0] + (
+            "=1937e17be38191d2b807da6e7732707840202155a3fbc989da32598be4ca2332"
+        )
+
+        with patch("webapp.server.time.time", return_value=1700000100):
+            self.assertTrue(
+                _verify_telegram_init_data(valid, token, expected_user_id=42)
+            )
+            self.assertFalse(
+                _verify_telegram_init_data(
+                    reversed_formula, token, expected_user_id=42
+                )
+            )
 
     def test_dashboard_fails_closed_without_explicit_webapp_user_id(self):
         from webapp.server import app
