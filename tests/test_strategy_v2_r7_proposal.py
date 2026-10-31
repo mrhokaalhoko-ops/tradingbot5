@@ -44,6 +44,7 @@ from strategy_v2.r7_proposal import (
     ProposalAssemblyStatus,
     assemble_research_proposal,
 )
+from strategy_v2.r9_replay import build_replay_case
 
 
 D = Decimal
@@ -310,6 +311,23 @@ def test_atomic_contract_requires_all_research_identities():
     malformed_decision = replace(proposal.decision, attempt_id=None)
     with pytest.raises(ValueError, match="thesis, setup, and attempt"):
         replace(proposal, decision=malformed_decision)
+
+
+def test_r7_components_build_one_consistent_r9_replay_case():
+    values = bundle()
+    proposal = assemble_research_proposal(**values).proposal
+    case = build_replay_case(
+        proposal=proposal,
+        entry=values["entry"],
+        stop=values["stop"],
+        target=values["target"],
+        risk=values["risk"],
+    )
+    assert case.proposal_assembly_id == proposal.assembly_id
+    assert case.entry_price == values["entry"].executable_price
+    assert case.stop_price == values["stop"].final_stop
+    assert case.target_price == values["target"].selected_target.price
+    assert case.execution_authority is False
 
 
 def test_r7_has_no_execution_or_exchange_surface():
