@@ -305,6 +305,13 @@ def test_evidence_is_unique_and_complete():
     assert values["portfolio"].result_id in evidence
 
 
+def test_atomic_contract_requires_all_research_identities():
+    proposal = assemble_research_proposal(**bundle()).proposal
+    malformed_decision = replace(proposal.decision, attempt_id=None)
+    with pytest.raises(ValueError, match="thesis, setup, and attempt"):
+        replace(proposal, decision=malformed_decision)
+
+
 def test_r7_has_no_execution_or_exchange_surface():
     path = Path(__file__).parents[1] / "strategy_v2" / "r7_proposal.py"
     source = path.read_text(encoding="utf-8")

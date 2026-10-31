@@ -95,6 +95,14 @@ class AtomicResearchProposal:
             raise TypeError("typed strategy decision required")
         if self.decision.status is not DecisionStatus.PROPOSAL_CANDIDATE:
             raise ValueError("atomic proposal requires candidate decision")
+        if (
+            type(self.decision.thesis_id) is not ThesisId
+            or type(self.decision.setup_id) is not SetupId
+            or type(self.decision.attempt_id) is not AttemptId
+        ):
+            raise ValueError("atomic proposal requires thesis, setup, and attempt identities")
+        if self.decision.execution_authority:
+            raise ValueError("atomic research proposal cannot carry execution authority")
         for name in (
             "contract_epoch_id", "entry_qualification_id", "stop_plan_id",
             "target_plan_id", "risk_plan_id", "portfolio_result_id",
