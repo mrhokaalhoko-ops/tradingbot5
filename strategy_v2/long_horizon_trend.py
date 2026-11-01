@@ -187,6 +187,32 @@ def _make_trade(
     )
 
 
+def breakout_side(rows: pd.DataFrame, index: int) -> str | None:
+    """Return a fresh causal breakout side for a completed bar, if any."""
+    if index < 0 or index >= len(rows):
+        return None
+    bar = rows.iloc[index]
+    required = (bar.atr, bar.entry_high, bar.entry_low)
+    if not all(pd.notna(value) and math.isfinite(float(value)) for value in required):
+        return None
+    previous_close = float(rows.iloc[index - 1].close) if index > 0 else float("nan")
+    previous_high = float(rows.iloc[index - 1].entry_high) if index > 0 else float("nan")
+    previous_low = float(rows.iloc[index - 1].entry_low) if index > 0 else float("nan")
+    long_break = float(bar.close) > float(bar.entry_high) and not (
+        math.isfinite(previous_close)
+        and math.isfinite(previous_high)
+        and previous_close > previous_high
+    )
+    short_break = float(bar.close) < float(bar.entry_low) and not (
+        math.isfinite(previous_close)
+        and math.isfinite(previous_low)
+        and previous_close < previous_low
+    )
+    if long_break ^ short_break:
+        return "LONG" if long_break else "SHORT"
+    return None
+
+
 def simulate_symbol(
     symbol: str,
     four_hour_bars: pd.DataFrame,
@@ -292,21 +318,10 @@ def simulate_symbol(
 
         if pending_entry is not None or index + 1 >= len(rows):
             continue
-        required = (bar.atr, bar.entry_high, bar.entry_low)
-        if not all(pd.notna(value) and math.isfinite(float(value)) for value in required):
-            continue
-        previous_close = float(rows.iloc[index - 1].close) if index > 0 else float("nan")
-        previous_high = float(rows.iloc[index - 1].entry_high) if index > 0 else float("nan")
-        previous_low = float(rows.iloc[index - 1].entry_low) if index > 0 else float("nan")
-        long_break = float(bar.close) > float(bar.entry_high) and not (
-            math.isfinite(previous_close) and math.isfinite(previous_high) and previous_close > previous_high
-        )
-        short_break = float(bar.close) < float(bar.entry_low) and not (
-            math.isfinite(previous_close) and math.isfinite(previous_low) and previous_close < previous_low
-        )
-        if long_break ^ short_break:
+        side = breakout_side(rows, index)
+        if side is not None:
             pending_entry = {
-                "side": "LONG" if long_break else "SHORT",
+                "side": side,
                 "signal_time": bar.close_time,
                 "atr": float(bar.atr),
             }
