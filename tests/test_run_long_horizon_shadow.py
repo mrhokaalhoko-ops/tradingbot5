@@ -84,6 +84,17 @@ def test_public_fetch_retains_compressed_raw_response():
     assert len(frame) == 1
 
 
+def test_http_rejection_becomes_typed_fail_closed_error():
+    from urllib.error import HTTPError
+
+    def rejected(*args, **kwargs):
+        raise HTTPError("https://example.invalid", 451, "blocked", {}, None)
+
+    with pytest.raises(RUNNER.PublicMarketDataError) as captured:
+        RUNNER.fetch_completed_hourly("BTCUSDT", opener=rejected)
+    assert captured.value.reason_code == "HTTP_451"
+
+
 def test_journal_commit_recovers_state_and_detects_tampering(tmp_path):
     policy = LongHorizonTrendPolicy()
     journal = RUNNER.ShadowJournal(tmp_path, build_id="test-build", policy=policy)
@@ -148,6 +159,29 @@ def test_cycle_writes_independent_states_without_execution_authority(tmp_path):
     snapshot = json.loads(journal.snapshot_path.read_text(encoding="utf-8"))
     assert snapshot["execution_authority"] is False
     assert len(journal._records()) == 2
+
+
+def test_cycle_keeps_symbols_isolated_when_public_feed_fails(tmp_path):
+    policy = LongHorizonTrendPolicy()
+    journal = RUNNER.ShadowJournal(tmp_path, build_id="test-build", policy=policy)
+
+    def fetcher(symbol):
+        if symbol == "BTCUSDT":
+            raise RUNNER.PublicMarketDataError("HTTP_451", "blocked")
+        return _hourly(), {
+            "source": "synthetic",
+            "symbol": symbol,
+            "collector_received_at": "2026-01-26T00:00:30+00:00",
+        }
+
+    states, events = RUNNER.run_cycle(journal, fetcher=fetcher)
+    assert set(states) == {"ETHUSDT"}
+    assert [event["event_type"] for event in events] == [
+        "OBSERVATION_ERROR",
+        "WARMUP_ESTABLISHED",
+    ]
+    assert events[0]["reason"] == "HTTP_451"
+    assert all(event["execution_authority"] is False for event in events)
 
 
 def test_runner_has_no_execution_or_private_client_imports():

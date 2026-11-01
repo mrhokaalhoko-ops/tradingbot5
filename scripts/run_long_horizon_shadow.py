@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Callable, Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import zlib
@@ -46,6 +47,12 @@ FORBIDDEN_CREDENTIAL_VARIABLES = (
     "FUTURES_API_KEY",
     "FUTURES_API_SECRET",
 )
+
+
+class PublicMarketDataError(RuntimeError):
+    def __init__(self, reason_code: str, message: str):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def assert_no_trading_credentials(environment: Mapping[str, str]) -> None:
@@ -108,15 +115,25 @@ def fetch_completed_hourly(
         method="GET",
     )
     request_started_at = pd.Timestamp(clock())
-    with opener(request, timeout=20) as response:
-        body = response.read()
-        status = int(getattr(response, "status", 200))
-        response_date = response.headers.get("Date") if getattr(response, "headers", None) else None
+    try:
+        with opener(request, timeout=20) as response:
+            body = response.read()
+            status = int(getattr(response, "status", 200))
+            response_date = (
+                response.headers.get("Date") if getattr(response, "headers", None) else None
+            )
+    except HTTPError as exc:
+        raise PublicMarketDataError(f"HTTP_{exc.code}", "public kline endpoint rejected request") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise PublicMarketDataError("NETWORK_UNAVAILABLE", "public kline endpoint unavailable") from exc
     received_at = pd.Timestamp(clock())
     if status != 200:
-        raise RuntimeError(f"public kline request failed with HTTP {status}")
-    payload = json.loads(body.decode("utf-8"))
-    frame = parse_public_klines(payload, received_at=received_at)
+        raise PublicMarketDataError(f"HTTP_{status}", "public kline endpoint returned non-success")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        frame = parse_public_klines(payload, received_at=received_at)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise PublicMarketDataError("MALFORMED_PUBLIC_RESPONSE", "invalid public kline response") from exc
     evidence = {
         "source": "BINANCE_USDM_PUBLIC_TRADE_PRICE_KLINES",
         "endpoint": PUBLIC_KLINE_ENDPOINT,
@@ -315,7 +332,25 @@ def run_cycle(
     states = journal.load_states()
     all_events: list[dict] = []
     for symbol in SYMBOLS:
-        hourly, evidence = fetcher(symbol)
+        try:
+            hourly, evidence = fetcher(symbol)
+        except PublicMarketDataError as exc:
+            observed_at = pd.Timestamp.now(tz="UTC").isoformat()
+            identity = {
+                "event_type": "OBSERVATION_ERROR",
+                "symbol": symbol,
+                "reason": exc.reason_code,
+                "observed_at": observed_at,
+                "build_id": journal.build_id,
+            }
+            all_events.append(
+                {
+                    "event_id": "lhts_" + sha256(_canonical(identity)).hexdigest()[:24],
+                    **identity,
+                    "execution_authority": False,
+                }
+            )
+            continue
         bars = aggregate_hourly_to_4h(hourly)
         state = states.get(symbol, new_symbol_state(symbol, journal.policy))
         observed_at = evidence["collector_received_at"]
@@ -357,7 +392,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(event, sort_keys=True), flush=True)
             if args.once:
                 return 0
-            time.sleep(args.poll_seconds)
+            failed_observation = any(
+                event.get("event_type") == "OBSERVATION_ERROR" for event in events
+            )
+            time.sleep(max(args.poll_seconds, 60.0) if failed_observation else args.poll_seconds)
 
 
 if __name__ == "__main__":
