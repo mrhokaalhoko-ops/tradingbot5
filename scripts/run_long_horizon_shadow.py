@@ -36,6 +36,8 @@ from strategy_v2.long_horizon_trend import LongHorizonTrendPolicy, aggregate_hou
 
 PUBLIC_KLINE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 SYMBOLS = ("BTCUSDT", "ETHUSDT")
+PROFILE_LONG_4H = "long-4h"
+PROFILE_FAST_1H_LONG = "fast-1h-long"
 FORBIDDEN_CREDENTIAL_VARIABLES = (
     "BINANCE_API_KEY",
     "BINANCE_API_SECRET",
@@ -53,6 +55,23 @@ class PublicMarketDataError(RuntimeError):
     def __init__(self, reason_code: str, message: str):
         super().__init__(message)
         self.reason_code = reason_code
+
+
+def profile_configuration(profile: str) -> tuple[LongHorizonTrendPolicy, str, tuple[str, ...]]:
+    if profile == PROFILE_LONG_4H:
+        return LongHorizonTrendPolicy(), "4h", ("LONG", "SHORT")
+    if profile == PROFILE_FAST_1H_LONG:
+        return (
+            LongHorizonTrendPolicy(
+                policy_id="FAST_1H_10D_5D_LONG_ONLY_V1",
+                entry_lookback_bars=240,
+                exit_lookback_bars=120,
+                atr_bars=48,
+            ),
+            "1h",
+            ("LONG",),
+        )
+    raise ValueError(f"unknown shadow profile: {profile}")
 
 
 def assert_no_trading_credentials(environment: Mapping[str, str]) -> None:
@@ -328,6 +347,8 @@ def run_cycle(
     *,
     fetcher: Callable = fetch_completed_hourly,
     maximum_signal_delay_seconds: float = 120.0,
+    bar_interval: str = "4h",
+    allowed_sides: tuple[str, ...] = ("LONG", "SHORT"),
 ) -> tuple[dict, tuple[dict, ...]]:
     states = journal.load_states()
     all_events: list[dict] = []
@@ -351,7 +372,13 @@ def run_cycle(
                 }
             )
             continue
-        bars = aggregate_hourly_to_4h(hourly)
+        if bar_interval == "4h":
+            bars = aggregate_hourly_to_4h(hourly)
+        elif bar_interval == "1h":
+            bars = hourly.copy()
+            bars["close_time"] = pd.to_datetime(bars["open_time"], utc=True) + pd.Timedelta(hours=1)
+        else:
+            raise ValueError(f"unsupported shadow bar interval: {bar_interval}")
         state = states.get(symbol, new_symbol_state(symbol, journal.policy))
         observed_at = evidence["collector_received_at"]
         updated, events = advance_symbol_state(
@@ -360,6 +387,8 @@ def run_cycle(
             observed_at=observed_at,
             policy=journal.policy,
             maximum_signal_delay_seconds=maximum_signal_delay_seconds,
+            bar_interval=bar_interval,
+            allowed_sides=allowed_sides,
         )
         if updated != state or events:
             journal.append(symbol=symbol, state=updated, events=events, evidence=evidence)
@@ -374,6 +403,11 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--build-id", required=True)
     parser.add_argument("--poll-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--profile",
+        choices=(PROFILE_LONG_4H, PROFILE_FAST_1H_LONG),
+        default=PROFILE_LONG_4H,
+    )
     parser.add_argument("--once", action="store_true")
     return parser.parse_args(argv)
 
@@ -383,11 +417,15 @@ def main(argv: list[str] | None = None) -> int:
     assert_no_trading_credentials(os.environ)
     if args.poll_seconds < 5:
         raise ValueError("poll interval must be at least five seconds")
-    policy = LongHorizonTrendPolicy()
+    policy, bar_interval, allowed_sides = profile_configuration(args.profile)
     journal = ShadowJournal(args.data_dir, build_id=args.build_id, policy=policy)
     with SingleInstanceLock(args.data_dir):
         while True:
-            _, events = run_cycle(journal)
+            _, events = run_cycle(
+                journal,
+                bar_interval=bar_interval,
+                allowed_sides=allowed_sides,
+            )
             for event in events:
                 print(json.dumps(event, sort_keys=True), flush=True)
             if args.once:

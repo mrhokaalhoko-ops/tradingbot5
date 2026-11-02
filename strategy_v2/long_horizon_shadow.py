@@ -1,6 +1,6 @@
-"""Pure state transitions for the standalone BTC/ETH trend shadow.
+"""Pure state transitions for the standalone BTC/ETH trend shadows.
 
-The caller supplies completed 4h trade-price bars and a collector observation
+The caller supplies completed trade-price bars and a collector observation
 time.  No network, storage, exchange, or runtime module is imported here.
 """
 
@@ -64,29 +64,37 @@ def _event(kind: str, symbol: str, bar, observed_at, policy_hash: str, **details
 
 def advance_symbol_state(
     state: dict,
-    completed_four_hour_bars: pd.DataFrame,
+    completed_bars: pd.DataFrame,
     *,
     observed_at,
     policy: LongHorizonTrendPolicy = LongHorizonTrendPolicy(),
     maximum_signal_delay_seconds: float = 120.0,
+    bar_interval: str = "4h",
+    allowed_sides: tuple[str, ...] = ("LONG", "SHORT"),
 ) -> tuple[dict, tuple[dict, ...]]:
     """Advance one persisted shadow state without retrospective signals."""
     if not math.isfinite(float(maximum_signal_delay_seconds)) or maximum_signal_delay_seconds < 0:
         raise ValueError("maximum signal delay must be finite and non-negative")
+    interval = pd.Timedelta(bar_interval)
+    if interval <= pd.Timedelta(0):
+        raise ValueError("bar interval must be positive")
+    sides = tuple(dict.fromkeys(str(side).upper() for side in allowed_sides))
+    if not sides or any(side not in {"LONG", "SHORT"} for side in sides):
+        raise ValueError("allowed sides must be a non-empty LONG/SHORT subset")
     current = deepcopy(state)
     if current.get("policy_hash") != policy.policy_hash:
         raise ValueError("state policy hash does not match the active policy")
-    rows = add_causal_indicators(completed_four_hour_bars, policy)
+    rows = add_causal_indicators(completed_bars, policy)
     if rows.empty:
         return current, ()
     opens = pd.to_datetime(rows["open_time"], utc=True)
     if opens.duplicated().any() or not opens.is_monotonic_increasing:
-        raise ValueError("completed 4h bars must be unique and ordered")
-    if len(opens) > 1 and not opens.diff().dropna().eq(pd.Timedelta(hours=4)).all():
-        raise ValueError("completed 4h bars must be contiguous")
+        raise ValueError("completed bars must be unique and ordered")
+    if len(opens) > 1 and not opens.diff().dropna().eq(interval).all():
+        raise ValueError("completed bars must be contiguous")
     closes = pd.to_datetime(rows["close_time"], utc=True)
-    if not closes.eq(opens + pd.Timedelta(hours=4)).all():
-        raise ValueError("completed 4h bar close times are invalid")
+    if not closes.eq(opens + interval).all():
+        raise ValueError("completed bar close times are invalid")
     observed = pd.Timestamp(observed_at)
     if observed.tzinfo is None:
         observed = observed.tz_localize("UTC")
@@ -270,6 +278,8 @@ def advance_symbol_state(
             and current.get("pending_entry") is None
         ):
             side = breakout_side(rows, index) if signal_allowed else None
+            if side not in sides:
+                side = None
             if side is not None:
                 current["pending_entry"] = {
                     "side": side,

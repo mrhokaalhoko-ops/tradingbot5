@@ -51,6 +51,19 @@ def test_public_kline_parser_excludes_unfinished_rows():
     assert frame.iloc[0].close == 1.5
 
 
+def test_fast_profile_is_explicit_long_only_and_does_not_change_default():
+    default, interval, sides = RUNNER.profile_configuration(RUNNER.PROFILE_LONG_4H)
+    assert default == LongHorizonTrendPolicy()
+    assert interval == "4h"
+    assert sides == ("LONG", "SHORT")
+
+    fast, interval, sides = RUNNER.profile_configuration(RUNNER.PROFILE_FAST_1H_LONG)
+    assert fast.policy_id == "FAST_1H_10D_5D_LONG_ONLY_V1"
+    assert (fast.entry_lookback_bars, fast.exit_lookback_bars, fast.atr_bars) == (240, 120, 48)
+    assert interval == "1h"
+    assert sides == ("LONG",)
+
+
 def test_public_fetch_retains_compressed_raw_response():
     body = json.dumps([[0, "1", "2", "0.5", "1.5", "10", 3_599_999]]).encode()
 

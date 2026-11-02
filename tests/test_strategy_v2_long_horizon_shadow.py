@@ -133,6 +133,53 @@ def test_clock_before_close_is_recorded_and_cannot_signal():
     assert [event["event_type"] for event in events] == ["CLOCK_ANOMALY"]
 
 
+def test_hourly_long_only_profile_accepts_long_and_suppresses_other_sides():
+    policy = _policy()
+    frame = _bars(5)
+    frame["open_time"] = pd.date_range("2026-01-01", periods=5, freq="1h", tz="UTC")
+    frame["close_time"] = frame["open_time"] + pd.Timedelta(hours=1)
+    state = new_symbol_state("BTCUSDT", policy)
+    state["last_processed_open_time"] = frame.iloc[-2].open_time.isoformat()
+    updated, events = advance_symbol_state(
+        state,
+        frame,
+        observed_at=frame.iloc[-1].close_time + pd.Timedelta(seconds=30),
+        policy=policy,
+        bar_interval="1h",
+        allowed_sides=("LONG",),
+    )
+    assert [event["event_type"] for event in events] == ["SHADOW_SIGNAL"]
+    assert updated["pending_entry"]["side"] == "LONG"
+
+    suppressed, events = advance_symbol_state(
+        state,
+        frame,
+        observed_at=frame.iloc[-1].close_time + pd.Timedelta(seconds=30),
+        policy=policy,
+        bar_interval="1h",
+        allowed_sides=("SHORT",),
+    )
+    assert events == ()
+    assert suppressed["pending_entry"] is None
+
+
+def test_hourly_profile_rejects_non_contiguous_bars():
+    policy = _policy()
+    frame = _bars(5)
+    frame["open_time"] = pd.date_range("2026-01-01", periods=5, freq="1h", tz="UTC")
+    frame["close_time"] = frame["open_time"] + pd.Timedelta(hours=1)
+    state = new_symbol_state("ETHUSDT", policy)
+    state["last_processed_open_time"] = frame.iloc[0].open_time.isoformat()
+    with pytest.raises(ValueError, match="contiguous"):
+        advance_symbol_state(
+            state,
+            frame.drop(index=2).reset_index(drop=True),
+            observed_at=frame.iloc[-1].close_time,
+            policy=policy,
+            bar_interval="1h",
+        )
+
+
 def test_incremental_shadow_matches_frozen_offline_trade_math():
     policy = _policy()
     times = pd.date_range("2026-01-01", periods=10, freq="4h", tz="UTC")
@@ -174,3 +221,33 @@ def test_incremental_shadow_matches_frozen_offline_trade_math():
     assert actual["entry_price"] == pytest.approx(reference.entry_price)
     assert actual["exit_price"] == pytest.approx(reference.exit_price)
     assert actual["net_r"] == pytest.approx(reference.net_r)
+
+
+def test_hourly_long_only_shadow_matches_offline_trade_math():
+    policy = _policy()
+    frame = _bars(9)
+    frame["open_time"] = pd.date_range("2026-01-01", periods=len(frame), freq="1h", tz="UTC")
+    frame["close_time"] = frame["open_time"] + pd.Timedelta(hours=1)
+    expected = tuple(trade for trade in simulate_symbol("BTCUSDT", frame, policy) if trade.side == "LONG")
+    assert len(expected) == 1
+
+    state = new_symbol_state("BTCUSDT", policy)
+    state["last_processed_open_time"] = frame.iloc[3].open_time.isoformat()
+    completed = []
+    for end in range(5, len(frame) + 1):
+        bar = frame.iloc[end - 1]
+        state, events = advance_symbol_state(
+            state,
+            frame.iloc[:end],
+            observed_at=pd.Timestamp(bar.close_time) + pd.Timedelta(seconds=30),
+            policy=policy,
+            bar_interval="1h",
+            allowed_sides=("LONG",),
+        )
+        completed.extend(
+            event["trade"] for event in events if event["event_type"] == "SHADOW_EXIT"
+        )
+    assert len(completed) == 1
+    assert completed[0]["entry_time"] == expected[0].entry_time
+    assert completed[0]["exit_time"] == expected[0].exit_time
+    assert completed[0]["net_r"] == pytest.approx(expected[0].net_r)
