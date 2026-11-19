@@ -16,6 +16,12 @@ from engines.social_engine import SocialEngine
 from strategy.hybrid_logic import HybridStrategy
 from strategy.risk_manager import RiskManager, entry_sizing_balances
 from strategy.trailing_stop import TrailingStopManager
+from strategy.strategy_v2_evidence import (
+    collect_authoritative_proposal_evidence,
+    collect_closed_outcome_evidence,
+    collect_post_exit_checkpoint,
+)
+from strategy.strategy_v2_shadow_storage import get_shadow_evidence_store
 from strategy.alert_manager import TradeApproachAlertManager
 from strategy.entry_confirmation import (
     build_setup_thesis_id,
@@ -41,6 +47,10 @@ from utils.state_manager import StateManager
 from utils.performance_tracker import PerformanceTracker
 from utils.candle_sync import seconds_to_next_candle
 from core.config import Config
+from core.startup import (
+    validate_live_trading_confirmation as _validate_live_trading_confirmation,
+    validate_telegram_proposal_demo_mode as _validate_telegram_proposal_demo_mode,
+)
 from core.universe_filter import UniverseFilter
 from filters.derivatives_risk_filter import DerivativesRiskFilter
 from utils.api_status_monitor import APIStatusMonitor
@@ -80,6 +90,40 @@ CLOSE_ALREADY_PROCESSING = "ALREADY_PROCESSING"
 CLOSE_PERSIST_RETRY_BASE_SECONDS = 60
 CLOSE_PERSIST_RETRY_MAX_SECONDS = 15 * 60
 CLOSE_PERSIST_NOTIFICATION_INTERVAL_SECONDS = 60 * 60
+
+
+def _strategy_v2_shadow_store():
+    """Lazily open the isolated research store only when the flag is enabled."""
+    return get_shadow_evidence_store(
+        Config.STRATEGY_V2_SHADOW_DIR,
+        max_bytes=Config.STRATEGY_V2_SHADOW_MAX_BYTES,
+    )
+
+
+def _collect_strategy_v2_proposal_shadow(*, proposal, coin_data, audit_ids):
+    """Best-effort observation hook; its result never participates in V1."""
+    if not getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+        return False
+    try:
+        collect_authoritative_proposal_evidence(
+            storage=_strategy_v2_shadow_store(),
+            proposal=proposal,
+            coin_data=coin_data,
+            reset_evidence=_thesis_reset_evidence(
+                coin_data.get("_ta_context") or {}
+            ),
+            audit_ids=audit_ids,
+        )
+        return True
+    except Exception as shadow_error:
+        audit_decision_event(
+            **audit_ids,
+            stage="STRATEGY_V2_SHADOW_DECISION",
+            status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+            details={"error_type": type(shadow_error).__name__},
+            durable=True,
+        )
+        return False
 
 
 def _market_regime_label(value):
@@ -830,20 +874,6 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
          "expected_entry": current_price, "profile": filter_profile.get("key")},
     )
 
-    if (
-        Config.TELEGRAM_PROPOSAL_DEMO_MODE
-        and not Config.DEMO_EXECUTION_ENABLED
-    ):
-        _execution_event(
-            "DEMO_EXECUTION_DISABLED",
-            {"order_calls_possible": False},
-            durable=True,
-        )
-        logger.warning(
-            f"[{symbol}] Demo proposal execution is disabled; no proposal or order was emitted."
-        )
-        return False
-
     # لا يمكن لأي caller مستقبلي تجاوز استرداد startup أو حالة state تالفة.
     if state_manager.get("recovery_complete", True) is not True:
         logger.critical(f"[{symbol}] رُفض التنفيذ: استرداد التشغيل غير مكتمل.")
@@ -1101,7 +1131,9 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
     target_plan = dict(getattr(risk_manager, "last_plan", {}) or {})
     coin_data["target_plan"] = target_plan
     stop_plan = dict(target_plan.get("stop_plan") or {})
-    if stop_plan.get("policy") == "STRUCTURAL_INITIAL_STOP_V1":
+    if stop_plan.get("policy") in {
+        "STRUCTURAL_INITIAL_STOP_V1", "STRUCTURAL_INITIAL_STOP_V2"
+    }:
         # Use the exact quantity Binance will accept, but do not increase or
         # otherwise change sizing.  Structure stays fixed; excess risk skips.
         rounded_amount = client.preview_order_amount(symbol, amount, current_price)
@@ -1126,7 +1158,7 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
             logger.warning(f"[{symbol}] {reason}: {risk_check}")
             coin_data["decision"] = "🔴 REJECT"
             coin_data["reason"] = reason
-            coin_data["rejection_stage"] = "STRUCTURAL_INITIAL_STOP_V1"
+            coin_data["rejection_stage"] = stop_plan.get("policy")
             scan_results.append(coin_data)
             return False
         amount = float(rounded_amount)
@@ -1173,6 +1205,41 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
             target_plan=target_plan,
         )
         coin_data["user_visible_trade_proposal"] = proposal
+        _collect_strategy_v2_proposal_shadow(
+            proposal=proposal, coin_data=coin_data, audit_ids=audit_ids
+        )
+
+    # تعطيل إرسال أوامر Demo لا يعطّل تحليل السوق أو عرض الاقتراحات. ننشر
+    # الاقتراح النهائي بعد اكتمال جميع فحوص الاستراتيجية/المخاطر، ثم نتوقف
+    # قبل حفظ نية إرسال أمر وقبل Entry POST. بذلك تبقى واجهة Telegram قابلة
+    # للمراجعة في وضع observation-only مع ضمان order_calls_possible=false.
+    if (
+        Config.TELEGRAM_PROPOSAL_DEMO_MODE
+        and not Config.DEMO_EXECUTION_ENABLED
+    ):
+        proposal_visible = bool(
+            proposal
+            and _publish_authoritative_trade_proposal(
+                state_manager=state_manager,
+                notifier=notifier,
+                proposal=proposal,
+                audit_ids=audit_ids,
+            )
+        )
+        _execution_event(
+            "DEMO_EXECUTION_DISABLED",
+            {
+                "order_calls_possible": False,
+                "proposal_id": proposal.get("proposal_id") if proposal else None,
+                "proposal_visible": proposal_visible,
+            },
+            durable=True,
+        )
+        logger.info(
+            f"[{symbol}] Demo execution disabled; proposal_visible="
+            f"{proposal_visible}; no order intent or Entry POST was created."
+        )
+        return False
 
     intent_saved = state_manager.save_order_intent(symbol, {
         "trade_id": trade_id,
@@ -2063,27 +2130,43 @@ def _execute_and_protect_trade_locked(symbol, final_decision, amount, current_pr
         execution_failure
         and execution_failure.get("send_attempted") is False
     )
+    failure_code = str(execution_failure.get("code") or "")
+    explicit_exchange_reject = failure_code == "ENTRY_REJECTED_BY_EXCHANGE"
+    ambiguous_transport = failure_code == "ORDER_SUBMISSION_UNRESOLVED"
     intent_archived = False
-    if local_pre_submit:
+    if local_pre_submit or explicit_exchange_reject:
         # لم يصل create_order إلى Binance إطلاقاً، لذلك يمكن إنهاء النية
-        # بأمان وإبقاء إعداد Sniper متاحاً لمحاولة شمعة مغلقة لاحقة.
+        # بأمان. الرفض الصريح من Binance نهائي أيضاً ولا يحتاج reconciliation.
+        terminal_status = (
+            "ENTRY_REJECTED_BY_EXCHANGE"
+            if explicit_exchange_reject else "ENTRY_LOCAL_PRECHECK_FAILED"
+        )
         intent_archived = state_manager.archive_order_intent(
             symbol,
-            "ENTRY_LOCAL_PRECHECK_FAILED",
-            proofs={"execution_failure": execution_failure, "order_sent": False},
+            terminal_status,
+            proofs={
+                "execution_failure": execution_failure,
+                "order_sent": bool(explicit_exchange_reject),
+                "reconciliation_required": False,
+            },
+        )
+    else:
+        terminal_status = (
+            "ENTRY_TRANSPORT_AMBIGUOUS"
+            if ambiguous_transport else "ENTRY_STATUS_UNKNOWN"
         )
     proposal = coin_data.get("user_visible_trade_proposal") or proposal or {}
     if proposal:
         _proposal_ledger_update(
             state_manager,
             proposal,
-            "ENTRY_LOCAL_PRECHECK_FAILED" if local_pre_submit else "ENTRY_STATUS_UNKNOWN",
+            terminal_status,
             entry_post_count=0 if local_pre_submit else 1,
             execution_failure=execution_failure,
-            reconciliation_required=not local_pre_submit,
+            reconciliation_required=not (local_pre_submit or explicit_exchange_reject),
         )
     _execution_event(
-        "ENTRY_LOCAL_PRECHECK_FAILED" if local_pre_submit else "ENTRY_ORDER_NOT_CONFIRMED",
+        terminal_status,
         {
             "execution_failure": execution_failure,
             "intent_archived": intent_archived,
@@ -2162,6 +2245,166 @@ def update_trade_excursions(entry_meta, current_price, symbol=None):
         return changed
     except (TypeError, ValueError):
         return False
+
+
+POST_EXIT_HORIZONS_MINUTES = (15, 30, 60, 120)
+STOP_THEN_RUN_THRESHOLDS_R = (0.5, 1.0, 1.5, 2.0)
+
+
+def register_post_exit_observation(state_manager, symbol, entry_meta, exit_details, *, is_stop):
+    """Register a read-only post-exit observation; it has no execution authority."""
+    entry = float(entry_meta.get("entry_price") or 0.0)
+    initial_sl = float(entry_meta.get("initial_sl") or entry_meta.get("sl") or 0.0)
+    exit_price = float(exit_details.get("exit_price") or 0.0)
+    risk = abs(entry - initial_sl)
+    if min(entry, initial_sl, exit_price, risk) <= 0:
+        return False
+    side = str(entry_meta.get("side") or "BUY").upper()
+    trade_id = str(
+        entry_meta.get("trade_id") or entry_meta.get("position_id")
+        or f"{symbol}:{int(time.time())}"
+    )
+    now = time.time()
+    sign = 1.0 if side in ("BUY", "LONG") else -1.0
+    exit_r_from_entry = sign * (exit_price - entry) / risk
+    item = {
+        "observation_id": trade_id,
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "entry_price": entry,
+        "initial_sl": initial_sl,
+        "initial_risk_per_unit": risk,
+        "exit_price": exit_price,
+        "exit_at_epoch": now,
+        "exit_time": exit_details.get("exit_time"),
+        "exit_reason": exit_details.get("exit_reason"),
+        "realized_r": float(exit_details.get("final_r") or 0.0),
+        "exit_r_from_entry": float(exit_r_from_entry),
+        "is_stop_exit": bool(is_stop),
+        "post_exit_mfe_r": float(exit_r_from_entry),
+        "post_exit_mae_r": float(exit_r_from_entry),
+        "max_post_exit_price": exit_price,
+        "min_post_exit_price": exit_price,
+        "checkpoints": {},
+        "stop_then_run": [],
+        "next_check_at": now,
+        "complete": False,
+        "read_only": True,
+    }
+    saved = state_manager.register_post_exit_observation(item)
+    if saved:
+        audit_decision_event(
+            symbol=symbol, trade_id=trade_id, position_id=trade_id,
+            stage="POST_EXIT_OBSERVATION", status="REGISTERED",
+            details={
+                "is_stop_exit": bool(is_stop), "exit_price": exit_price,
+                "realized_r": item["realized_r"],
+                "horizons_minutes": list(POST_EXIT_HORIZONS_MINUTES),
+            }, durable=True,
+        )
+    return saved
+
+
+def monitor_post_exit_observations(client, state_manager, now=None):
+    """Measure post-exit MFE/MAE at fixed horizons without placing any order."""
+    now = float(now or time.time())
+    observations = state_manager.get_post_exit_observations()
+    if not isinstance(observations, dict) or not observations:
+        return 0
+    changed = 0
+    for key, item in observations.items():
+        if item.get("complete") or now < float(item.get("next_check_at") or 0.0):
+            continue
+        try:
+            price = float(client.get_current_price(item["symbol"]) or 0.0)
+            if price <= 0:
+                item["next_check_at"] = now + 60.0
+                continue
+            entry = float(item["entry_price"])
+            risk = float(item["initial_risk_per_unit"])
+            side = str(item.get("side") or "BUY").upper()
+            sign = 1.0 if side in ("BUY", "LONG") else -1.0
+            directional_r = sign * (price - entry) / risk
+            item["post_exit_mfe_r"] = max(
+                float(item.get("post_exit_mfe_r") or directional_r), directional_r
+            )
+            item["post_exit_mae_r"] = min(
+                float(item.get("post_exit_mae_r") or directional_r), directional_r
+            )
+            item["max_post_exit_price"] = max(
+                float(item.get("max_post_exit_price") or price), price
+            )
+            item["min_post_exit_price"] = min(
+                float(item.get("min_post_exit_price") or price), price
+            )
+            elapsed_minutes = max(0.0, (now - float(item["exit_at_epoch"])) / 60.0)
+            checkpoints = item.setdefault("checkpoints", {})
+            for horizon in POST_EXIT_HORIZONS_MINUTES:
+                label = f"{horizon}m"
+                if elapsed_minutes >= horizon and label not in checkpoints:
+                    checkpoints[label] = {
+                        "observed_at_epoch": now,
+                        "price": price,
+                        "directional_r": directional_r,
+                        "post_exit_mfe_r": item["post_exit_mfe_r"],
+                        "post_exit_mae_r": item["post_exit_mae_r"],
+                    }
+                    audit_decision_event(
+                        symbol=item["symbol"], trade_id=item.get("trade_id"),
+                        position_id=item.get("trade_id"),
+                        stage="POST_EXIT_MFE", status=label.upper(),
+                        details=checkpoints[label], durable=True,
+                    )
+                    if getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+                        try:
+                            collect_post_exit_checkpoint(
+                                storage=_strategy_v2_shadow_store(),
+                                trade_id=str(item.get("trade_id") or ""),
+                                horizon=label,
+                                checkpoint=checkpoints[label],
+                            )
+                        except Exception as shadow_error:
+                            audit_decision_event(
+                                symbol=item.get("symbol"),
+                                trade_id=item.get("trade_id"),
+                                stage="STRATEGY_V2_SHADOW_OUTCOME",
+                                status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+                                details={"error_type": type(shadow_error).__name__},
+                            )
+            if item.get("is_stop_exit"):
+                achieved = [
+                    level for level in STOP_THEN_RUN_THRESHOLDS_R
+                    if float(item["post_exit_mfe_r"]) >= level
+                ]
+                previous = set(float(v) for v in item.get("stop_then_run", []))
+                new_levels = [level for level in achieved if level not in previous]
+                if new_levels:
+                    item["stop_then_run"] = sorted(previous.union(new_levels))
+                    audit_decision_event(
+                        symbol=item["symbol"], trade_id=item.get("trade_id"),
+                        position_id=item.get("trade_id"),
+                        stage="STOP_THEN_RUN", status="DETECTED",
+                        details={
+                            "new_thresholds_r": new_levels,
+                            "post_exit_mfe_r": item["post_exit_mfe_r"],
+                            "realized_r": item.get("realized_r"),
+                        }, durable=True,
+                    )
+            item["next_check_at"] = now + 60.0
+            if elapsed_minutes >= max(POST_EXIT_HORIZONS_MINUTES):
+                item["complete"] = True
+                item["completed_at_epoch"] = now
+            changed += 1
+        except Exception as exc:
+            item["last_error"] = type(exc).__name__
+            item["next_check_at"] = now + 120.0
+            logger.warning(
+                f"[PostExit] تعذر قياس {item.get('symbol')}: {type(exc).__name__}"
+            )
+    if changed:
+        state_manager.save_post_exit_observations(observations)
+    return changed
 
 
 def _run_post_close_enrichment(client, notifier, symbol, entry_meta, exit_details):
@@ -2473,6 +2716,55 @@ def _handle_trade_close_inner(alert, state_manager, client, symbol, notifier=Non
     )
 
     proposal = entry_meta.get("user_visible_trade_proposal") or {}
+    if proposal and getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+        try:
+            shadow_store = _strategy_v2_shadow_store()
+            collect_closed_outcome_evidence(
+                storage=shadow_store,
+                proposal_id=str(
+                    proposal.get("proposal_id") or entry_meta.get("trade_id") or ""
+                ),
+                trade_id=str(entry_meta.get("trade_id") or ""),
+                symbol=symbol,
+                exit_details=exit_details,
+                audit_ids={
+                    "scan_id": decision_context.get("scan_id") or entry_meta.get("scan_id"),
+                    "decision_id": decision_context.get("decision_id") or entry_meta.get("decision_id"),
+                    "signal_id": decision_context.get("decision_id") or entry_meta.get("decision_id"),
+                    "setup_id": entry_meta.get("setup_thesis_id"),
+                    "thesis_id": entry_meta.get("setup_thesis_id"),
+                    "position_id": entry_meta.get("position_id") or entry_meta.get("trade_id"),
+                    "trade_id": entry_meta.get("trade_id"),
+                    "symbol": symbol,
+                },
+            )
+            thesis_id = entry_meta.get("setup_thesis_id")
+            if thesis_id:
+                shadow_store.record_closed_thesis(
+                    symbol,
+                    str(thesis_id),
+                    side=str(entry_meta.get("side") or ""),
+                    closed_at=str(
+                        exit_details.get("exit_time")
+                        or alert.get("closed_at")
+                        or alert.get("timestamp")
+                        or datetime.now(timezone.utc).isoformat()
+                    ),
+                    details={
+                        "trade_id": entry_meta.get("trade_id"),
+                        "pnl": pnl_val,
+                        "close_type": close_type,
+                    },
+                )
+        except Exception as shadow_error:
+            audit_decision_event(
+                symbol=symbol,
+                trade_id=entry_meta.get("trade_id"),
+                stage="STRATEGY_V2_SHADOW_OUTCOME",
+                status="SHADOW_COLLECTION_ERROR_V1_UNCHANGED",
+                details={"error_type": type(shadow_error).__name__},
+                durable=True,
+            )
     if proposal:
         _proposal_ledger_update(
             state_manager,
@@ -2487,6 +2779,10 @@ def _handle_trade_close_inner(alert, state_manager, client, symbol, notifier=Non
             funding=exit_details.get("funding"),
             reconciliation="RECONCILED",
         )
+
+    register_post_exit_observation(
+        state_manager, symbol, entry_meta, exit_details, is_stop=is_sl
+    )
 
     # نحذف metadata فور نجاح التسجيل الدائم. TradeJournal/AI لا يملكان حق
     # إبقاء الصفقة في حالة إغلاق معلقة؛ سيعملان في خيط منفصل بعد التنظيف.
@@ -3183,8 +3479,40 @@ def build_entry_ta_context(ta_details: dict) -> dict:
         },
         "recent_sell_side_sweep": bool(details.get("recent_sell_side_sweep", False)),
         "recent_buy_side_sweep": bool(details.get("recent_buy_side_sweep", False)),
+        "bos_created_at": str(details.get("bos_created_at") or ""),
+        "choch_created_at": str(details.get("choch_created_at") or ""),
+        "liquidity_sweep_at": str(details.get("liquidity_sweep_at") or ""),
+        "entry_zone_created_at": str(details.get("entry_zone_created_at") or ""),
+        "htf_context_changed_at": str(details.get("htf_context_changed_at") or ""),
         "setup_anchor": safe_anchor,
     }
+
+
+def _thesis_reset_evidence(ta_context: dict) -> list[dict]:
+    """Expose only timestamps already carried by V1; never invent evidence."""
+    context = ta_context or {}
+    evidence = []
+    anchor = context.get("setup_anchor") or {}
+    if anchor.get("created_at"):
+        evidence.append({
+            "event": "NEW_ORDER_BLOCK",
+            "timestamp": anchor["created_at"],
+            "source": "setup_anchor.created_at",
+        })
+    for field, event in (
+        ("bos_created_at", "NEW_BOS"),
+        ("choch_created_at", "NEW_CHOCH"),
+        ("liquidity_sweep_at", "NEW_LIQUIDITY_SWEEP"),
+        ("entry_zone_created_at", "NEW_ENTRY_ZONE"),
+        ("htf_context_changed_at", "MATERIAL_HTF_CONTEXT_CHANGE"),
+    ):
+        if context.get(field):
+            evidence.append({
+                "event": event,
+                "timestamp": context[field],
+                "source": field,
+            })
+    return evidence
 
 
 def run_bot_iteration(client, hybrid_strategy, risk_manager, trailing_manager, state_manager, notifier, news_engine, ai_engine, ta_engine, social_engine, universe_filter, derivatives_filter, active_strategies, last_scan_time=None):
@@ -3757,6 +4085,16 @@ def run_bot_iteration(client, hybrid_strategy, risk_manager, trailing_manager, s
             'analysis_side_source': 'HTF_1H_AND_15M_EMA_OBSERVATION' if analysis_side else None,
             'context_1h': analysis_context_1h,
         }
+        if getattr(Config, "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", False):
+            closed_15m_at = _closed_bar_end_utc(latest, 15)
+            coin_data["_strategy_v2_shadow_sources"] = {
+                "15m": {
+                    "confirmed_at": (
+                        closed_15m_at.isoformat() if closed_15m_at else ""
+                    ),
+                    "source": "run_bot_iteration.closed_15m_bar",
+                }
+            }
         audit_decision_event(
             scan_id=scan_id,
             decision_id=decision_id,
@@ -6980,6 +7318,81 @@ def monitor_virtual_orders(client, state_manager, notifier, trailing_manager, ri
         except Exception as e:
             logger.error(f"❌ فشل تحويل الأمر المعلق إلى صفقة حقيقية للزوج {symbol}: {e}")
 
+def _emit_confirmed_protection_notification(
+    *, state_manager, notifier, symbol, meta, stage, revision,
+    previous_sl, requested_sl, confirmed_sl, message,
+):
+    """Notify exactly once for a venue-confirmed protection revision."""
+    dedup = {"emit": True, "reason": "DEDUP_DISABLED"}
+    if getattr(Config, "PROTECTION_NOTIFICATION_DEDUP_ENABLED", True):
+        dedup = state_manager.record_confirmed_protection_notification(
+            symbol,
+            trade_id=str(meta.get("trade_id") or meta.get("position_id") or symbol),
+            protection_revision=str(revision),
+            confirmed_sl=float(confirmed_sl),
+            stage=str(stage),
+        )
+    audit_decision_event(
+        scan_id=meta.get("scan_id"), decision_id=meta.get("decision_id"),
+        setup_id=meta.get("setup_thesis_id"), position_id=meta.get("trade_id"),
+        trade_id=meta.get("trade_id"), symbol=symbol,
+        stage="PROTECTION_NOTIFICATION",
+        status="EMITTED" if dedup.get("emit") else "DEDUP_SKIPPED",
+        details={
+            "previous_confirmed_sl": float(previous_sl or 0.0),
+            "requested_new_sl": float(requested_sl or 0.0),
+            "confirmed_new_sl": float(confirmed_sl or 0.0),
+            "protection_stage": str(stage),
+            "notification_emitted": bool(dedup.get("emit")),
+            "dedup_reason": dedup.get("reason"),
+        },
+        durable=True,
+    )
+    if dedup.get("emit"):
+        notifier.send_message(message)
+    return dedup
+
+
+def _request_stop_replacement(client, symbol, side, amount, requested_stop):
+    """Normalize legacy and durable SL replacement APIs to an explicit state."""
+    stateful = getattr(client, "replace_sl_order_state", None)
+    stateful_declared = (
+        callable(getattr(type(client), "replace_sl_order_state", None))
+        or "replace_sl_order_state" in getattr(client, "__dict__", {})
+    )
+    if callable(stateful) and stateful_declared:
+        return stateful(symbol, side, amount, requested_stop)
+    legacy = client.replace_sl_order(symbol, side, amount, requested_stop)
+    return {
+        "state": "CONFIRMED" if legacy else "FAILED",
+        "confirmed_stop": legacy or None,
+        "requested_stop": requested_stop,
+        "reason": "LEGACY_BOOLEAN_RESULT",
+    }
+
+
+def _record_pending_stop_replacement(
+    *, state_manager, meta, symbol, stage, requested_stop, old_stop,
+    replacement, audit_status,
+):
+    retry_after = max(
+        float(replacement.get("retry_after") or 0.0),
+        time.time() + 2.0,
+    )
+    meta["sl_replace_retry_after"] = retry_after
+    meta["protection_status"] = "UPGRADE_RECONCILING"
+    state_manager.save_entry_metadata(symbol, meta)
+    audit_decision_event(
+        scan_id=meta.get("scan_id"), decision_id=meta.get("decision_id"),
+        setup_id=meta.get("setup_thesis_id"), position_id=meta.get("trade_id"),
+        trade_id=meta.get("trade_id"), symbol=symbol,
+        stage=stage, status=audit_status,
+        details={"old_sl": old_stop, "requested_sl": requested_stop,
+                 "reason": replacement.get("reason"), "retry_after": retry_after},
+        durable=True,
+    )
+
+
 def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
     """
     إدارة مراحل حماية الربح دون إغلاق جزئي. المستوى النهائي تملكه أوامر
@@ -7020,6 +7433,12 @@ def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
                     logger.error(
                         f"[{symbol}] تعذر حفظ MFE/MAE؛ ستُعاد المحاولة في الدورة التالية."
                     )
+
+            # V2 deliberately removes the 85%/92% price-hugging and TP1 75%
+            # locks.  The original full position and final venue target remain;
+            # TrailingStopManager alone advances SL behind confirmed structure.
+            if getattr(Config, "TRADE_MANAGEMENT_V2_ENABLED", False):
+                continue
 
             if not tp_steps:
                 continue
@@ -7162,15 +7581,20 @@ def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
                 )
 
                 if sl_improved and current_amount > 0 and not sl_update_blocked:
-                    normalized_sl = client.replace_sl_order(symbol, side, current_amount, new_sl)
-                    ok = bool(normalized_sl)
+                    replacement = _request_stop_replacement(
+                        client, symbol, side, current_amount, new_sl
+                    )
+                    replacement_state = str(replacement.get("state") or "FAILED")
+                    ok = replacement_state in {"CONFIRMED", "NOOP_PROTECTED"}
                     if ok:
                         meta.pop("sl_replace_retry_after", None)
-                        new_sl = float(normalized_sl)
+                        new_sl = float(replacement.get("confirmed_stop"))
                         step["status"] = "done"
                         state_manager.mark_tp_step_done(symbol, idx, new_sl)
                         trailing_manager.mark_step_trail_active(symbol, new_sl, current_amount)
                         meta["current_sl"] = new_sl
+                        meta["current_sl_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+                        meta["protection_stage"] = f"PROTECTION_STAGE_{idx + 1}"
                         state_manager.save_entry_metadata(symbol, meta)
                         logger.info(
                             f"[StepTrail] 🛡️ {symbol} TP{idx+1} → SL محمي عند {new_sl:.6f} ({sl_label})"
@@ -7184,12 +7608,28 @@ def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
                                      "current_price": current_price, "old_sl": old_sl,
                                      "new_sl": new_sl, "full_amount": current_amount}, durable=True,
                         )
-                        notifier.send_message(
-                            f"🛡️ <b>حماية ربح TP{idx+1}</b>\n"
+                        _emit_confirmed_protection_notification(
+                            state_manager=state_manager, notifier=notifier,
+                            symbol=symbol, meta=meta,
+                            stage=f"PROTECTION_STAGE_{idx + 1}",
+                            revision=f"TP_MILESTONE_{idx + 1}",
+                            previous_sl=old_sl, requested_sl=new_sl,
+                            confirmed_sl=new_sl,
+                            message=(
+                            f"🛡️ <b>مرحلة الحماية {idx+1}</b>\n"
                             f"الزوج: <code>{symbol}</code>\n"
-                            f"السعر وصل: <code>{current_price:.5f}</code> (الهدف: <code>{step_price:.5f}</code>)\n"
+                            f"السعر وصل: <code>{current_price:.5f}</code> (المعلم: <code>{step_price:.5f}</code>)\n"
                             f"تم رفع SL إلى {sl_label}: <code>{new_sl:.6f}</code>\n"
                             f"🔒 الكمية الكاملة محتفظ بها — لا إغلاق جزئي."
+                            ),
+                        )
+                    elif replacement_state == "PENDING_VERIFICATION":
+                        sl_update_blocked = True
+                        _record_pending_stop_replacement(
+                            state_manager=state_manager, meta=meta, symbol=symbol,
+                            stage="POSITION_MANAGEMENT", requested_stop=new_sl,
+                            old_stop=old_sl, replacement=replacement,
+                            audit_status="TP_MILESTONE_SL_REPLACE_PENDING",
                         )
                     else:
                         sl_update_blocked = True
@@ -7253,12 +7693,17 @@ def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
 
                     if not sl_ok and not sl_update_blocked:
                         old_sl = current_sl
-                        normalized_sl = client.replace_sl_order(symbol, side, current_amount, be_sl)
-                        ok = bool(normalized_sl)
+                        replacement = _request_stop_replacement(
+                            client, symbol, side, current_amount, be_sl
+                        )
+                        replacement_state = str(replacement.get("state") or "FAILED")
+                        ok = replacement_state in {"CONFIRMED", "NOOP_PROTECTED"}
                         if ok:
                             meta.pop("sl_replace_retry_after", None)
-                            be_sl = float(normalized_sl)
+                            be_sl = float(replacement.get("confirmed_stop"))
                             meta["current_sl"] = be_sl
+                            meta["current_sl_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+                            meta["protection_stage"] = f"PREEMPTIVE_{2 if near_l2 else 1}"
                             state_manager.save_entry_metadata(symbol, meta)
                             trailing_manager.mark_step_trail_active(symbol, be_sl, current_amount)
                             logger.info(
@@ -7276,13 +7721,29 @@ def manage_tp_ladder(client, state_manager, trailing_manager, notifier):
                                          "old_sl": old_sl, "new_sl": be_sl,
                                          "full_amount": current_amount}, durable=True,
                             )
-                            notifier.send_message(
+                            _emit_confirmed_protection_notification(
+                                state_manager=state_manager, notifier=notifier,
+                                symbol=symbol, meta=meta,
+                                stage=f"PREEMPTIVE_{2 if near_l2 else 1}",
+                                revision=f"PREEMPTIVE_{2 if near_l2 else 1}",
+                                previous_sl=old_sl, requested_sl=be_sl,
+                                confirmed_sl=be_sl,
+                                message=(
                                 f"🛡️ <b>حماية استباقية — المرحلة {'2' if near_l2 else '1'}</b>\n"
                                 f"الزوج: <code>{symbol}</code>\n"
                                 f"السعر وصل <b>{protect_label}</b> نحو TP1 (<code>{tp1_price:.5f}</code>)\n"
                                 f"تم رفع SL لحجز <b>{int(protect_pct*100)}%</b> من المسافة: "
                                 f"<code>{be_sl:.6f}</code>\n"
                                 f"🔒 الكمية الكاملة محتفظ بها — لا إغلاق جزئي."
+                                ),
+                            )
+                        elif replacement_state == "PENDING_VERIFICATION":
+                            sl_update_blocked = True
+                            _record_pending_stop_replacement(
+                                state_manager=state_manager, meta=meta, symbol=symbol,
+                                stage="POSITION_MANAGEMENT", requested_stop=be_sl,
+                                old_stop=old_sl, replacement=replacement,
+                                audit_status="PREEMPTIVE_SL_REPLACE_PENDING",
                             )
                         else:
                             sl_update_blocked = True
@@ -7313,6 +7774,10 @@ def monitor_active_trades(client, state_manager, trailing_manager, alert_manager
     """
     if not getattr(Config, "ACCOUNT_MANAGEMENT_ENABLED", True):
         return last_check_time
+
+    # Runs on the account-owning runtime even when there are no active
+    # positions. It is read-only and never creates/cancels orders.
+    monitor_post_exit_observations(client, state_manager)
 
     active_symbols = state_manager.get_active_symbols()
     if not active_symbols:
@@ -7372,9 +7837,46 @@ def monitor_active_trades(client, state_manager, trailing_manager, alert_manager
                 if current_price:
                     # أ) تحديث الستوب المتحرك
                     if trailing_manager.has_trade(sym):
+                        previous_confirmed_sl = float(
+                            trailing_manager.get_current_sl(sym)
+                            or meta.get("current_sl") or meta.get("initial_sl")
+                            or meta.get("sl") or 0.0
+                        )
                         new_sl = trailing_manager.update(sym, current_price, client)
                         if new_sl:
                             logger.info(f"تم تفعيل الستوب المتحرك للزوج {sym} عند السعر {new_sl}")
+                            updated_meta = state_manager.get_entry_metadata(sym) or meta
+                            trade_info = trailing_manager.get_trade_info(sym) or {}
+                            # A breach-triggered emergency close unregisters the trade;
+                            # only a still-registered trade proves an SL replacement.
+                            if trailing_manager.has_trade(sym):
+                                stage = str(
+                                    updated_meta.get("protection_stage")
+                                    or trade_info.get("protection_stage")
+                                    or "TRAILING_STOP"
+                                )
+                                confirmed_at = str(
+                                    updated_meta.get("current_sl_confirmed_at")
+                                    or trade_info.get("current_sl_confirmed_at") or ""
+                                )
+                                _emit_confirmed_protection_notification(
+                                    state_manager=state_manager,
+                                    notifier=notifier,
+                                    symbol=sym,
+                                    meta=updated_meta,
+                                    stage=stage,
+                                    revision=f"{stage}:{confirmed_at}:{float(new_sl):.12g}",
+                                    previous_sl=previous_confirmed_sl,
+                                    requested_sl=float(new_sl),
+                                    confirmed_sl=float(new_sl),
+                                    message=(
+                                        f"🛡️ <b>تحديث حماية مؤكد</b>\n"
+                                        f"الزوج: <code>{sym}</code>\n"
+                                        f"المرحلة: <code>{stage}</code>\n"
+                                        f"SL السابق: <code>{previous_confirmed_sl:.8g}</code>\n"
+                                        f"SL المؤكد: <code>{float(new_sl):.8g}</code>"
+                                    ),
+                                )
 
                     # ب) التحقق من إشعارات الاقتراب
                     if meta:
@@ -7590,12 +8092,6 @@ def _scanner_thread(
     last_scan_time = int(time.time() * 1000)
 
     while not _shutdown_event.is_set():
-        if (
-            Config.TELEGRAM_PROPOSAL_DEMO_MODE
-            and not Config.DEMO_EXECUTION_ENABLED
-        ):
-            _shutdown_event.wait(timeout=5.0)
-            continue
         scan_interval = int(
             state_manager.get(
                 "scan_interval_seconds",
@@ -7711,6 +8207,22 @@ def _monitor_thread(
                         "[ProtectionRecovery] استبدال SL ما زال قيد الحسم: "
                         f"{protection_sagas.get('pending')}"
                     )
+                # A durable saga may become verified on this monitor tick,
+                # after the original strategy caller already returned.  Keep
+                # the in-memory trailing manager aligned with the
+                # exchange-confirmed StateManager value before it evaluates a
+                # new candidate.  Regression is rejected inside the manager.
+                sync_confirmed = getattr(trailing_manager, "sync_confirmed_stop", None)
+                if callable(sync_confirmed):
+                    for protected_symbol in state_manager.get_active_symbols():
+                        protected_meta = state_manager.get_entry_metadata(protected_symbol) or {}
+                        confirmed_stop = protected_meta.get("current_sl")
+                        if confirmed_stop:
+                            sync_confirmed(
+                                protected_symbol,
+                                confirmed_stop,
+                                protected_meta.get("current_sl_confirmed_at"),
+                            )
             monitor_last_time = monitor_active_trades(
                 client, state_manager, trailing_manager,
                 alert_manager, notifier, monitor_last_time
@@ -7777,41 +8289,18 @@ def _run_api_health_check(api_status_monitor):
 
 def validate_live_trading_confirmation():
     """يرفض وضع LIVE قبل إنشاء أي عميل أو اتصال خارجي."""
-    if (
-        not Config.USE_TESTNET
-        and os.getenv("LIVE_TRADING_CONFIRMATION") != "I_ACCEPT_REAL_MONEY_RISK"
-    ):
-        raise RuntimeError(
-            "Live trading blocked: LIVE_TRADING_CONFIRMATION is missing or incorrect."
-        )
-    return True
+    return _validate_live_trading_confirmation(Config)
 
 
 def validate_telegram_proposal_demo_mode():
     """Reject an unsafe bridge configuration before ExchangeClient exists."""
-    if not Config.TELEGRAM_PROPOSAL_DEMO_MODE:
-        return {"enabled": False}
-    if not Config.USE_TESTNET:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_MODE_REQUIRES_USE_TESTNET_TRUE")
-    if not Config.BINANCE_API_KEY or not Config.BINANCE_API_SECRET:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_CREDENTIALS_MISSING")
-    if int(Config.LEVERAGE) != 5:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_REQUIRES_5X_LEVERAGE")
-    return {
-        "enabled": True,
-        "execution_enabled": bool(Config.DEMO_EXECUTION_ENABLED),
-        "effective_position_cap": (
-            min(
-                int(Config.TESTNET_MAX_OPEN_TRADES),
-                int(Config.HARD_MAX_OPEN_TRADES),
-            )
-            if Config.DEMO_EXECUTION_ENABLED
-            else 0
-        ),
-        "telegram_polling_enabled": bool(Config.TELEGRAM_POLLING_ENABLED),
-        "telegram_outbound_enabled": bool(Config.TELEGRAM_OUTBOUND_ENABLED),
-        "account_management_enabled": bool(Config.ACCOUNT_MANAGEMENT_ENABLED),
-    }
+    return _validate_telegram_proposal_demo_mode(Config)
+
+
+def _release_writer_lease(writer_lease):
+    """Release the optional mutation lease during active or passive shutdown."""
+    if writer_lease is not None:
+        writer_lease.release()
 
 
 def main():
@@ -8247,7 +8736,7 @@ def main():
             close_forensics_db()
         except Exception as exc:
             logger.warning(f"[Shutdown] تعذر إغلاق اتصال قاعدة بيانات: {exc}")
-        writer_lease.release()
+        _release_writer_lease(writer_lease)
         record_run_end(_shutdown_reason)
         mark_graceful_shutdown(_shutdown_reason)
         stop_resource_monitor()

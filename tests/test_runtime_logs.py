@@ -508,7 +508,7 @@ class TestRuntimeLogExport(unittest.TestCase):
 class TestLogSecretRedaction(unittest.TestCase):
     def test_known_and_contextual_secrets_never_pass(self):
         api_key = "ABCD1234567890SECRETKEYVALUE"
-        telegram_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+        telegram_token = "REDACTED_TEST_TELEGRAM_TOKEN"
         with patch.dict(os.environ, {
             "BINANCE_API_KEY": api_key,
             "TELEGRAM_BOT_TOKEN": telegram_token,
@@ -522,6 +522,20 @@ class TestLogSecretRedaction(unittest.TestCase):
         self.assertNotIn(telegram_token, safe)
         self.assertNotIn("SUPERSECRETTOKEN123456789", safe)
         self.assertIn("ABCD****", safe)
+
+    def test_demo_binance_credentials_are_redacted_even_without_labels(self):
+        demo_key = "DEMO1234567890UNLABELLEDKEY"
+        demo_secret = "SECR" + "-".join(("synthetic", "demo", "secret", "value"))
+        with patch.dict(os.environ, {
+            "BINANCE_DEMO_API_KEY": demo_key,
+            "BINANCE_DEMO_API_SECRET": demo_secret,
+        }, clear=False):
+            safe = redact_secrets(f"{demo_key} {demo_secret}")
+
+        self.assertNotIn(demo_key, safe)
+        self.assertNotIn(demo_secret, safe)
+        self.assertIn("DEMO****", safe)
+        self.assertIn("SECR****", safe)
 
 
 class TestRuntimeLogTelegramAuthorization(unittest.TestCase):

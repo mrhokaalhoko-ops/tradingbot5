@@ -60,6 +60,10 @@ def _migrate_state_dict(saved):
 
     if version != CURRENT_STATE_SCHEMA_VERSION:
         raise ValueError(f"state migration stopped at unsupported v{version}")
+    # Additive v3 fields are deliberately kept schema-compatible so the
+    # reviewed 1.6.18 binary can still read the state during rollback.
+    migrated.setdefault("protection_notifications", {})
+    migrated.setdefault("post_exit_observations", {})
     return migrated
 
 
@@ -71,6 +75,7 @@ def _validate_state_dict(state):
         "archived_order_intents", "close_intents", "archived_close_intents",
         "protection_replacements", "archived_protection_replacements",
         "trailing_trades", "short_high_confidence_counters",
+        "protection_notifications", "post_exit_observations",
     ):
         value = state.get(key, {})
         if not isinstance(value, dict):
@@ -151,6 +156,8 @@ class StateManager:
             "archived_close_intents": {},
             "protection_replacements": {},
             "archived_protection_replacements": {},
+            "protection_notifications": {},
+            "post_exit_observations": {},
             "recovery_complete": False,
             "last_successful_reconciliation_at": None,
             "last_scan_completed_at": None,
@@ -573,6 +580,85 @@ class StateManager:
                 meta.pop(legacy_key, None)
             self.state["entry_metadata"][symbol] = meta
             self._save_state_unsafe()
+
+    def record_confirmed_protection_notification(
+        self,
+        symbol: str,
+        *,
+        trade_id: str,
+        protection_revision: str,
+        confirmed_sl: float,
+        stage: str,
+    ) -> dict:
+        """Atomically persist notification dedup after venue-confirmed SL.
+
+        The returned ``emit`` flag is true exactly once for a revision/price.
+        Persisting this in state prevents scan, retry and restart duplicates.
+        """
+        symbol = self._normalize_sym(symbol)
+        price = float(confirmed_sl or 0.0)
+        identity = (
+            f"{trade_id}|{protection_revision}|{price:.12g}"
+        )
+        with self._lock:
+            records = self.state.setdefault("protection_notifications", {})
+            previous = copy.deepcopy(records.get(symbol, {}))
+            if previous.get("identity") == identity:
+                return {
+                    "emit": False,
+                    "reason": "DUPLICATE_CONFIRMED_PROTECTION",
+                    "record": previous,
+                }
+            record = {
+                "identity": identity,
+                "trade_id": str(trade_id or ""),
+                "protection_revision": str(protection_revision or ""),
+                "confirmed_sl": price,
+                "stage": str(stage or ""),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            records[symbol] = record
+            if not self._save_state_unsafe(force=True):
+                if previous:
+                    records[symbol] = previous
+                else:
+                    records.pop(symbol, None)
+                return {
+                    "emit": False,
+                    "reason": "DEDUP_STATE_PERSIST_FAILED",
+                    "record": previous,
+                }
+            return {"emit": True, "reason": "NEW_CONFIRMED_PROTECTION", "record": record}
+
+    def get_protection_notification(self, symbol: str) -> dict:
+        symbol = self._normalize_sym(symbol)
+        with self._lock:
+            return copy.deepcopy(
+                self.state.get("protection_notifications", {}).get(symbol, {})
+            )
+
+    def register_post_exit_observation(self, observation: dict) -> bool:
+        """Persist a shadow-only post-exit measurement; never opens a trade."""
+        item = copy.deepcopy(observation or {})
+        key = str(item.get("trade_id") or item.get("observation_id") or "")
+        if not key:
+            return False
+        with self._lock:
+            self.state.setdefault("post_exit_observations", {})[key] = item
+            return bool(self._save_state_unsafe(force=True))
+
+    def get_post_exit_observations(self) -> dict:
+        with self._lock:
+            return copy.deepcopy(self.state.get("post_exit_observations", {}))
+
+    def save_post_exit_observations(self, observations: dict) -> bool:
+        with self._lock:
+            previous = self.state.get("post_exit_observations", {})
+            self.state["post_exit_observations"] = copy.deepcopy(observations or {})
+            if self._save_state_unsafe(force=True):
+                return True
+            self.state["post_exit_observations"] = previous
+            return False
 
     def get_sl_timeout_state(self, symbol: str) -> dict:
         """يجلب حالة مؤقت SL الزمني"""

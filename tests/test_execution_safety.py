@@ -32,6 +32,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
         client.exchange.price_to_precision.side_effect = lambda _symbol, price: str(price)
         client.exchange.market.return_value = {"id": "BTCUSDT"}
         client.exchange.fapiPrivateGetOpenAlgoOrders.return_value = []
+        client.exchange.fetch_open_orders.return_value = []
         client.exchange.fapiPrivatePostAlgoOrder.side_effect = lambda params: {
             "algoId": f"algo-{params.get('clientAlgoId', 'protection')}",
             "clientAlgoId": params.get("clientAlgoId"),
@@ -42,6 +43,12 @@ class TestExchangeProtectionSafety(unittest.TestCase):
             "positionSide": params.get("positionSide", "BOTH"),
         }
         return client
+
+    def test_passive_shutdown_accepts_missing_writer_lease(self):
+        main_module._release_writer_lease(None)
+        lease = Mock()
+        main_module._release_writer_lease(lease)
+        lease.release.assert_called_once_with()
 
     def test_trade_excursions_use_original_stop_risk(self):
         meta = {
@@ -190,6 +197,60 @@ class TestExchangeProtectionSafety(unittest.TestCase):
         })
         client.exchange.cancel_order.assert_not_called()
 
+    def test_protection_snapshot_is_unknown_when_algo_source_fails(self):
+        client = self._client()
+        client.exchange.fapiPrivateGetOpenAlgoOrders.side_effect = RuntimeError(
+            "algo timeout"
+        )
+        client.exchange.fetch_open_orders.return_value = []
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["source_status"]["algo"], "UNKNOWN")
+        self.assertEqual(result["source_status"]["regular"], "OK")
+
+    def test_protection_snapshot_queries_regular_even_when_algo_has_orders(self):
+        client = self._client()
+        client.exchange.fapiPrivateGetOpenAlgoOrders.return_value = [{
+            "algoId": "algo-stop",
+            "clientAlgoId": "stop-client",
+            "orderType": "STOP_MARKET",
+            "triggerPrice": "98",
+            "algoStatus": "NEW",
+        }]
+        regular_tp = {
+            "id": "regular-tp",
+            "type": "take_profit_market",
+            "info": {"orderType": "TAKE_PROFIT_MARKET", "stopPrice": "105"},
+        }
+        client.exchange.fetch_open_orders.side_effect = [[regular_tp], []]
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(len(result["sl_orders"]), 1)
+        self.assertEqual(len(result["tp_orders"]), 1)
+        self.assertEqual(
+            [call.kwargs["params"] for call in client.exchange.fetch_open_orders.call_args_list],
+            [{}, {"stop": True}],
+        )
+
+    def test_protection_snapshot_is_unknown_when_regular_source_fails(self):
+        client = self._client()
+        client.exchange.fetch_open_orders.side_effect = [
+            RuntimeError("regular timeout"),
+            [],
+        ]
+
+        result = client._fetch_position_protection_orders("BTC/USDT")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["source_status"]["algo"], "OK")
+        self.assertEqual(result["source_status"]["regular"], "UNKNOWN")
+
     def test_durable_sl_replacement_recovers_crash_after_cancel_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             old_state_file = state_module.STATE_FILE
@@ -303,7 +364,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
         client._create_close_position_protection = Mock(
             side_effect=TimeoutError("send status unknown")
         )
-        client.resolve_order_by_client_id = Mock(return_value={
+        client.resolve_algo_order_by_client_id = Mock(return_value={
             "status": "FOUND", "order": {"id": "adopted", "status": "NEW"},
         })
 
@@ -313,7 +374,7 @@ class TestExchangeProtectionSafety(unittest.TestCase):
             call.args[3] for call in state.transition_protection_replacement.call_args_list
         ]
         self.assertIn("NEW_ACKNOWLEDGED", phases)
-        client.resolve_order_by_client_id.assert_called_once_with(
+        client.resolve_algo_order_by_client_id.assert_called_once_with(
             "BTC/USDT", "stable-new-sl"
         )
 
@@ -880,6 +941,106 @@ class TestFullPositionStepTrail(unittest.TestCase):
         self.assertEqual(trade["full_amount"], 2.0)
         self.assertEqual(trade["initial_sl"], 95.0)
         self.assertEqual(trade["current_sl"], 101.0)
+
+
+class TestProtectionReplacementStateContract(unittest.TestCase):
+    def _client(self):
+        client = ExchangeClient.__new__(ExchangeClient)
+        client.normalize_price = Mock(side_effect=lambda _symbol, value: float(value))
+        client._stop_prices_equal = Mock(
+            side_effect=lambda first, second: abs(float(first) - float(second)) < 1e-9
+        )
+        return client
+
+    def test_acknowledged_durable_saga_is_pending_not_failed(self):
+        client = self._client()
+        state = Mock()
+        state.get_protection_replacement.return_value = {
+            "phase": "NEW_ACKNOWLEDGED",
+            "replacement_id": "replace-1",
+            "retry_after": 123.0,
+        }
+        client._state_manager = state
+        client.replace_sl_order = Mock(return_value=False)
+
+        result = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+
+        self.assertEqual(result["state"], "PENDING_VERIFICATION")
+        self.assertEqual(result["reason"], "NEW_ACKNOWLEDGED")
+        self.assertEqual(result["saga_id"], "replace-1")
+
+    def test_terminal_saga_failure_is_explicit(self):
+        client = self._client()
+        state = Mock()
+        state.get_protection_replacement.return_value = {
+            "phase": "EMERGENCY_CLOSE_REQUESTED",
+        }
+        client._state_manager = state
+        client.replace_sl_order = Mock(return_value=False)
+
+        result = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+
+        self.assertEqual(result["state"], "FAILED")
+        self.assertEqual(result["reason"], "EMERGENCY_CLOSE_REQUESTED")
+
+    def test_confirmed_and_noop_states_preserve_exchange_stop(self):
+        client = self._client()
+        client._state_manager = None
+        client.replace_sl_order = Mock(return_value=99.0)
+        confirmed = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+        self.assertEqual(confirmed["state"], "CONFIRMED")
+        self.assertEqual(confirmed["confirmed_stop"], 99.0)
+
+        client.replace_sl_order.return_value = 99.5
+        noop = client.replace_sl_order_state("BTC/USDT", "BUY", 0.1, 99.0)
+        self.assertEqual(noop["state"], "NOOP_PROTECTED")
+        self.assertEqual(noop["confirmed_stop"], 99.5)
+
+    def test_pending_trailing_replacement_is_not_counted_as_failure(self):
+        manager = TrailingStopManager()
+        manager.register_trade("BTC/USDT", "BUY", 100.0, 95.0, amount=1.0)
+        manager.calculate_atr = Mock(return_value=1.0)
+        manager.get_confirmed_swing = Mock(return_value=None)
+        client = Mock()
+        client.fetch_ohlcv.return_value = [
+            [index, 100.0, 101.0, 99.0, 100.5, 1.0] for index in range(30)
+        ]
+        client.normalize_price.side_effect = lambda _symbol, value: float(value)
+        client.get_position_amount.return_value = 1.0
+        client.replace_sl_order_state = Mock(return_value={
+            "state": "PENDING_VERIFICATION",
+            "reason": "NEW_ACKNOWLEDGED",
+            "retry_after": time.time() + 10,
+        })
+
+        self.assertIsNone(manager.update("BTC/USDT", 106.0, client))
+
+        trade = manager.get_trade_info("BTC/USDT")
+        self.assertEqual(trade["current_sl"], 95.0)
+        self.assertEqual(trade.get("_failed_sl_count", 0), 0)
+        self.assertNotIn("_failed_sl", trade)
+        self.assertGreater(trade.get("_sl_retry_after", 0), time.time())
+
+    def test_async_confirmation_synchronizes_without_regression(self):
+        state = Mock()
+        state.get_trailing_trades.return_value = {}
+        state.get_entry_metadata.return_value = {}
+        state.save_trailing_trades.return_value = True
+        manager = TrailingStopManager(state_manager=state)
+        manager.register_trade("BTC/USDT", "BUY", 100.0, 95.0, amount=1.0)
+        trade = manager.get_trade_info("BTC/USDT")
+        trade["_failed_sl"] = 98.0
+        trade["_failed_sl_count"] = 2
+        trade["_sl_retry_after"] = time.time() + 30
+
+        self.assertTrue(manager.sync_confirmed_stop("BTC/USDT", 99.0))
+        self.assertEqual(manager.get_current_sl("BTC/USDT"), 99.0)
+        self.assertEqual(trade["_failed_sl_count"], 0)
+        self.assertNotIn("_failed_sl", trade)
+        self.assertNotIn("_sl_retry_after", trade)
+
+        self.assertFalse(manager.sync_confirmed_stop("BTC/USDT", 98.0))
+        self.assertEqual(manager.get_current_sl("BTC/USDT"), 99.0)
 
 
 class TestUnifiedEntryExecutionGate(unittest.TestCase):
@@ -2392,6 +2553,27 @@ class TestWebAppAuth(unittest.TestCase):
 
         expired = self._signed_data(token, 123, now - 7200)
         self.assertFalse(_verify_telegram_init_data(expired, token, expected_user_id=123, max_age_seconds=3600))
+
+    def test_official_hmac_key_order_vector_and_reversed_formula_rejected(self):
+        token = "123456:ABC-telegram-test-token"
+        valid = (
+            "auth_date=1700000000&query_id=AAEAAAE&"
+            "user=%7B%22id%22%3A42%2C%22first_name%22%3A%22Ada%22%7D&"
+            "hash=2f3ff65369e4f1e23ba8fb5b19134dcf6719dd583552700025629bfd3364275b"
+        )
+        reversed_formula = valid.rsplit("=", 1)[0] + (
+            "=1937e17be38191d2b807da6e7732707840202155a3fbc989da32598be4ca2332"
+        )
+
+        with patch("webapp.server.time.time", return_value=1700000100):
+            self.assertTrue(
+                _verify_telegram_init_data(valid, token, expected_user_id=42)
+            )
+            self.assertFalse(
+                _verify_telegram_init_data(
+                    reversed_formula, token, expected_user_id=42
+                )
+            )
 
     def test_dashboard_fails_closed_without_explicit_webapp_user_id(self):
         from webapp.server import app

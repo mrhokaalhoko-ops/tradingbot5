@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/mrhokaalhoko-ops/tradingbot5/security/advisories/new
+    about: Report vulnerabilities, credential exposure, or exploitable execution issues privately.

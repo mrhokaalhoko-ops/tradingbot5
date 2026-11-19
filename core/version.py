@@ -7,7 +7,7 @@ Railway supplies the exact Git/deployment identity at runtime.
 import os
 
 
-APP_VERSION = "1.6.18"
+APP_VERSION = "1.6.19"
 
 GIT_COMMIT = os.getenv("RAILWAY_GIT_COMMIT_SHA", "").strip()
 GIT_BRANCH = os.getenv("RAILWAY_GIT_BRANCH", "").strip()

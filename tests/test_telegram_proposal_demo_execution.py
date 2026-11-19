@@ -370,6 +370,67 @@ class TestProposalToDemoExecution(unittest.TestCase):
 
         self.assertEqual(mode["effective_position_cap"], 10)
 
+    def test_execution_disabled_publishes_proposal_without_order_intent_or_post(self):
+        ledger, state, client, risk, notifier, trailing = self.dependencies()
+        coin = {
+            "entry_confirmation": {
+                "passed": True, "reason": "PASS", "bar_id": "bar-1"
+            },
+            "optimal_entry": 100.0,
+            "reason": "authoritative observation-only setup",
+            "winning_strategy": "SMC",
+            "_thesis_id": "observe-thesis-1",
+        }
+
+        with (
+            patch.object(Config, "TELEGRAM_PROPOSAL_DEMO_MODE", True),
+            patch.object(Config, "DEMO_EXECUTION_ENABLED", False),
+            patch.object(main_module, "audit_decision_event"),
+        ):
+            result = main_module.execute_and_protect_trade(
+                "BTC/USDT", "buy", 0.1, 100.0, 5, 0.0025, 2.0,
+                coin, None, None, {}, "buy", client, risk, trailing, state,
+                notifier, set(), [], trade_id="observe-proposal-1",
+            )
+
+        self.assertFalse(result)
+        notifier.send_trade_proposal.assert_called_once()
+        self.assertEqual(ledger["observe-proposal-1"]["status"], "VISIBLE")
+        client.execute_trade.assert_not_called()
+        client.place_sl_tp.assert_not_called()
+        state.save_order_intent.assert_not_called()
+
+    def test_scanner_runs_when_demo_execution_is_disabled(self):
+        dependencies = [Mock() for _ in range(13)]
+        state = dependencies[4]
+        state.get.side_effect = lambda key, default=None: default
+        state.get_active_symbols.return_value = set()
+
+        def stop_after_first_scan(*args, **kwargs):
+            main_module._shutdown_event.set()
+
+        main_module._shutdown_event.clear()
+        main_module._force_scan_event.clear()
+        try:
+            with (
+                patch.object(Config, "TELEGRAM_PROPOSAL_DEMO_MODE", True),
+                patch.object(Config, "DEMO_EXECUTION_ENABLED", False),
+                patch.object(main_module, "compute_next_candle_wakeup", return_value=0),
+                patch.object(main_module, "check_network_connection", return_value=True),
+                patch.object(
+                    main_module,
+                    "run_bot_iteration",
+                    side_effect=stop_after_first_scan,
+                ) as run_scan,
+                patch.object(main_module, "log_memory_milestone"),
+            ):
+                main_module._scanner_thread(*dependencies)
+        finally:
+            main_module._shutdown_event.clear()
+            main_module._force_scan_event.clear()
+
+        run_scan.assert_called_once()
+
     def test_algo_protection_receives_the_final_structural_stop(self):
         _, state, client, _risk, notifier, trailing = self.dependencies()
         state.get_demo_signal_execution_mode.return_value = "hybrid_decision"
@@ -442,6 +503,29 @@ class TestProposalToDemoExecution(unittest.TestCase):
 
 
 class TestDemoEnvironmentGuard(unittest.TestCase):
+    def test_exchange_client_blocks_entry_before_any_exchange_mutation_when_disabled(self):
+        client = ExchangeClient.__new__(ExchangeClient)
+        client.exchange = Mock()
+        client.last_execution_failure = None
+
+        with (
+            patch.object(Config, "TELEGRAM_PROPOSAL_DEMO_MODE", True),
+            patch.object(Config, "DEMO_EXECUTION_ENABLED", False),
+        ):
+            result = client.execute_trade(
+                "BTC/USDT", "buy", 0.1, current_price=100.0, leverage=5,
+                client_order_id="observation-only",
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            client.last_execution_failure["code"],
+            "DEMO_EXECUTION_DISABLED",
+        )
+        self.assertFalse(client.last_execution_failure["send_attempted"])
+        client.exchange.create_order.assert_not_called()
+        client.exchange.set_leverage.assert_not_called()
+
     def test_only_demo_fapi_routes_are_accepted(self):
         client = ExchangeClient.__new__(ExchangeClient)
         client.exchange = Mock()
@@ -505,7 +589,7 @@ class TestTelegramUiParity(unittest.TestCase):
     def test_release_version_is_1_6_18(self):
         from core.version import APP_VERSION
 
-        self.assertEqual(APP_VERSION, "1.6.18")
+        self.assertEqual(APP_VERSION, "1.6.19")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from core.config import Config
 from utils.telegram_bot import TelegramNotifier
 
 
@@ -163,6 +164,36 @@ class TestTelegramHtmlRenderer(unittest.TestCase):
         self.assertIn("فكرة قيد المراقبة", message)
         self.assertIn("ميل المراقبة: <b>🟢 LONG — شراء</b>", message)
         self.assertNotIn("الاتجاه المقترح", message)
+
+    def test_scan_summary_uses_canonical_runtime_webapp_url(self):
+        notifier = self._notifier()
+        notifier.send_message = Mock(return_value=True)
+
+        with patch.object(Config, "WEBAPP_URL", "https://current.example/dashboard"):
+            notifier.send_scan_summary(50, 0, False, [])
+
+        keyboard = notifier.send_message.call_args.kwargs["reply_markup"]
+        self.assertEqual(
+            keyboard["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://current.example/dashboard/",
+        )
+
+    def test_menu_button_updates_default_and_authorized_chat(self):
+        notifier = self._notifier()
+        notifier._post = Mock(side_effect=[{"ok": True}, {"ok": True}])
+
+        with patch.object(Config, "WEBAPP_URL", "https://current.example/app"):
+            notifier._set_webapp_menu_button()
+
+        self.assertEqual(notifier._post.call_count, 2)
+        default_payload = notifier._post.call_args_list[0].args[1]
+        chat_payload = notifier._post.call_args_list[1].args[1]
+        self.assertNotIn("chat_id", default_payload)
+        self.assertEqual(chat_payload["chat_id"], "123")
+        self.assertEqual(
+            default_payload["menu_button"]["web_app"]["url"],
+            "https://current.example/app/",
+        )
 
     def test_reports_menu_exposes_shadow_hot_list_without_trade_action(self):
         notifier = self._notifier()

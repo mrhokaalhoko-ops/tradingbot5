@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible defect without secrets or account data
+title: "[Bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: Do not disclose vulnerabilities, credentials, balances, order IDs, or exploitable execution details here. Follow SECURITY.md instead.
+  - type: checkboxes
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed secrets and account-identifying data.
+          required: true
+        - label: This is not a private security report.
+          required: true
+  - type: input
+    attributes:
+      label: Commit or version
+      placeholder: Git commit SHA or version string
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Runtime mode
+      options: [Offline test/replay, Shadow only, Binance Demo/Testnet, Documentation/build]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Minimal reproduction
+      description: Include deterministic inputs or a synthetic fixture. Never include real credentials.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized logs or traceback
+      render: shell
+  - type: input
+    attributes:
+      label: OS and Python version
+      placeholder: Ubuntu 24.04, Python 3.11.x
+    validations:
+      required: true

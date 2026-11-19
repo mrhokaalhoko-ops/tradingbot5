@@ -55,6 +55,47 @@ class Config:
     STRUCTURAL_INITIAL_STOP_V1_ENABLED = os.getenv(
         "STRUCTURAL_INITIAL_STOP_V1_ENABLED", "false"
     ).strip().lower() in ("true", "1", "yes")
+    # Independent strategy rollbacks.  V2 changes only initial invalidation
+    # selection and post-entry management; opportunity detection is untouched.
+    STRUCTURAL_STOP_V2_ENABLED = os.getenv(
+        "STRUCTURAL_STOP_V2_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    TRADE_MANAGEMENT_V2_ENABLED = os.getenv(
+        "TRADE_MANAGEMENT_V2_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    # Observation-only Strategy V2 evidence.  This flag cannot authorize or
+    # veto a V1 action; it only appends to a separate bounded SQLite store.
+    STRATEGY_V2_SHADOW_EVIDENCE_ENABLED = os.getenv(
+        "STRATEGY_V2_SHADOW_EVIDENCE_ENABLED", "false"
+    ).strip().lower() in ("true", "1", "yes")
+    STRATEGY_V2_SHADOW_DIR = os.getenv(
+        "STRATEGY_V2_SHADOW_DIR",
+        os.path.join(
+            os.getenv("DATA_DIR", "." if os.name == "nt" else "/app/data"),
+            "strategy_v2_shadow",
+        ),
+    )
+    STRATEGY_V2_SHADOW_MAX_BYTES = int(os.getenv(
+        "STRATEGY_V2_SHADOW_MAX_BYTES", str(128 * 1024 * 1024)
+    ))
+    PROTECTION_NOTIFICATION_DEDUP_ENABLED = os.getenv(
+        "PROTECTION_NOTIFICATION_DEDUP_ENABLED", "true"
+    ).strip().lower() in ("true", "1", "yes")
+    LIVE_SL_UI_SYNC_ENABLED = os.getenv(
+        "LIVE_SL_UI_SYNC_ENABLED", "true"
+    ).strip().lower() in ("true", "1", "yes")
+    TRADE_MANAGEMENT_V2_ACTIVATION_R = float(
+        os.getenv("TRADE_MANAGEMENT_V2_ACTIVATION_R", "1.5")
+    )
+    TRADE_MANAGEMENT_V2_ATR_BUFFER = float(
+        os.getenv("TRADE_MANAGEMENT_V2_ATR_BUFFER", "0.30")
+    )
+    TRADE_MANAGEMENT_V2_MIN_ATR_IMPROVEMENT = float(
+        os.getenv("TRADE_MANAGEMENT_V2_MIN_ATR_IMPROVEMENT", "0.15")
+    )
+    TRADE_MANAGEMENT_V2_MIN_RISK_IMPROVEMENT = float(
+        os.getenv("TRADE_MANAGEMENT_V2_MIN_RISK_IMPROVEMENT", "0.10")
+    )
     STRUCTURAL_STOP_ROUND_TRIP_COST_PCT = float(
         os.getenv("STRUCTURAL_STOP_ROUND_TRIP_COST_PCT", "0.0012")
     )
@@ -140,6 +181,13 @@ class Config:
     # Telegram Config
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    # Canonical public URL used by every Telegram Mini App entry point.  Keep
+    # the environment variable authoritative so a Railway migration cannot
+    # leave individual buttons pointing at an obsolete deployment.
+    WEBAPP_URL = os.getenv(
+        "WEBAPP_URL", "https://tradingbot5-production.up.railway.app/"
+    ).strip()
+    WEBAPP_PUBLIC_URL = os.getenv("WEBAPP_PUBLIC_URL", WEBAPP_URL).strip()
 
     # إعدادات التداول الافتراضية
     TRADE_SYMBOL = "BTC/USDT"

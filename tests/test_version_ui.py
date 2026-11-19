@@ -15,6 +15,7 @@ if "dotenv" not in sys.modules:
     sys.modules["dotenv"] = dotenv_stub
 
 from core.version import APP_VERSION, SHORT_COMMIT, VERSION_LABEL
+from core.config import Config
 from utils.telegram_bot import TelegramNotifier
 
 
@@ -51,6 +52,23 @@ class TestVersionUI(unittest.TestCase):
             for button in row
         }
         self.assertIn("gui_demo_signal_mode", callback_values)
+
+    def test_main_menu_uses_canonical_runtime_webapp_url(self):
+        notifier = self._notifier_without_network()
+        with patch.object(Config, "WEBAPP_URL", "https://current.example/app"):
+            keyboard = notifier.main_menu_keyboard()
+
+        dashboard = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(
+            dashboard["web_app"]["url"],
+            "https://current.example/app/",
+        )
+
+    def test_webapp_url_rejects_non_https_configuration(self):
+        notifier = self._notifier_without_network()
+        with patch.object(Config, "WEBAPP_URL", "http://unsafe.example"):
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                notifier._webapp_url()
 
     def test_demo_signal_mode_keyboard_marks_current_mode(self):
         notifier = self._notifier_without_network()

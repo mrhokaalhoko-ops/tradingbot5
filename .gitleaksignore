@@ -1,0 +1,4 @@
+# Synthetic credential used only to prove that log redaction also covers
+# unlabeled Binance Demo values. The historical literal is not a real secret;
+# keep this exact fingerprint because project history is never rewritten.
+38522f682057cfdb893fb42c7b6de131d28aae1d:tests/test_runtime_logs.py:generic-api-key:528

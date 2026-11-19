@@ -503,6 +503,176 @@ class RiskManager:
             "reason": "VALID" if invariant_ok and side_ok else "STRUCTURAL_STOP_INVARIANT_FAILED",
         }
 
+    def _structural_initial_stop_v2_plan(
+        self, side, entry_price, safe_atr, *, invalidation_level=None,
+        market_levels=None, setup_anchor=None, tick_size=0.0, spread=0.0,
+    ):
+        """Select thesis invalidation rather than automatically selecting entry anchor.
+
+        All supplied market levels are produced from closed candles before the
+        entry decision.  V2 ranks explicit invalidation and meaningful swings
+        above a local entry OB, then applies a volatility/tick/spread buffer.
+        """
+        levels = dict(market_levels or {})
+        anchor = dict(setup_anchor or {})
+        tick = self._finite_positive(tick_size)
+        spread = self._finite_positive(spread)
+        invalidation = self._finite_positive(invalidation_level)
+        candidates, rejected = [], []
+        is_long = side == "buy"
+        anchor_type = str(anchor.get("type") or "")
+        anchor_key = "low" if is_long else "high"
+        expected_anchor = "bullish_ob" if is_long else "bearish_ob"
+        entry_anchor_level = self._finite_positive(anchor.get(anchor_key)) if anchor else None
+        anchor_tolerance = max(tick, safe_atr * 0.05)
+
+        def add(raw, source, *, timeframe="15m", created_at="", relation="STRUCTURE", strength=0.0):
+            level = self._finite_positive(raw)
+            record = {
+                "structural_level": level,
+                "level_source": str(source),
+                "timeframe": str(timeframe or "15m"),
+                "created_at": str(created_at or ""),
+                "relation_to_thesis": str(relation),
+                "strength": float(strength or 0.0),
+            }
+            if not level:
+                record["reject_reason"] = "INVALID_PRICE"
+            elif (is_long and level >= entry_price) or (not is_long and level <= entry_price):
+                record["reject_reason"] = "WRONG_SIDE_OF_ENTRY"
+            else:
+                record["distance_pct"] = abs(entry_price - level) / entry_price
+                record["distance_atr"] = abs(entry_price - level) / safe_atr
+                candidates.append(record)
+                return
+            rejected.append(record)
+
+        if invalidation:
+            invalidation_is_anchor_alias = bool(
+                entry_anchor_level
+                and abs(invalidation - entry_anchor_level) <= anchor_tolerance
+                and not bool(anchor.get("is_thesis_invalidation", False))
+            )
+            add(
+                invalidation,
+                (
+                    "setup_invalidation_matches_entry_anchor"
+                    if invalidation_is_anchor_alias else "setup_invalidation"
+                ),
+                created_at=anchor.get("created_at"),
+                relation=(
+                    "ENTRY_ANCHOR_ALIAS"
+                    if invalidation_is_anchor_alias else "EXPLICIT_THESIS_INVALIDATION"
+                ),
+                strength=65.0 if invalidation_is_anchor_alias else 100.0,
+            )
+
+        if anchor:
+            add(
+                anchor.get(anchor_key), f"entry_anchor:{anchor_type or 'unknown'}",
+                created_at=anchor.get("created_at"), relation="ENTRY_ANCHOR",
+                strength=65.0 if anchor_type == expected_anchor else 35.0,
+            )
+
+        families = (
+            (("swing_lows", "price", "swing_low", 90.0),
+             ("bullish_obs", "low", "bullish_ob", 80.0))
+            if is_long else
+            (("swing_highs", "price", "swing_high", 90.0),
+             ("bearish_obs", "high", "bearish_ob", 80.0))
+        )
+        for family, key, label, base_strength in families:
+            for index, item in enumerate(levels.get(family, []) or []):
+                item = item or {}
+                age = float(item.get("age") or 0.0)
+                supplied_strength = float(item.get("strength") or 0.0)
+                recency_bonus = max(0.0, 5.0 - min(age, 5.0))
+                raw_level = self._finite_positive(item.get(key))
+                is_anchor_alias = bool(
+                    entry_anchor_level
+                    and raw_level
+                    and abs(raw_level - entry_anchor_level) <= anchor_tolerance
+                )
+                add(
+                    raw_level, f"{label}[{index}]",
+                    created_at=item.get("created_at"),
+                    relation="ENTRY_ANCHOR_ALIAS" if is_anchor_alias else "THESIS_STRUCTURE",
+                    strength=(65.0 if is_anchor_alias else base_strength + supplied_strength + recency_bonus),
+                )
+
+        selectable = [
+            item for item in candidates
+            if item.get("relation_to_thesis") not in {"ENTRY_ANCHOR", "ENTRY_ANCHOR_ALIAS"}
+        ]
+        if not selectable:
+            for item in candidates:
+                rejected.append({**item, "reject_reason": "ENTRY_ANCHOR_NOT_THESIS_INVALIDATION"})
+            return None, {
+                "policy": "STRUCTURAL_INITIAL_STOP_V2", "entry": float(entry_price),
+                "side": side, "atr": float(safe_atr),
+                "invalidation_level": invalidation,
+                "entry_anchor_level": entry_anchor_level,
+                "selected_thesis_invalidation": None,
+                "all_structural_candidates": candidates,
+                "rejected_structural_candidates": rejected,
+                "reason": "NO_VALID_THESIS_INVALIDATION", "clamp": "NONE",
+            }
+
+        # Higher thesis relevance wins.  For equal relevance, prefer the more
+        # conservative level (lower support for LONG, higher resistance for SHORT).
+        selected = sorted(
+            selectable,
+            key=lambda item: (
+                item["strength"],
+                -item["structural_level"] if is_long else item["structural_level"],
+            ),
+            reverse=True,
+        )[0]
+        for item in candidates:
+            if item is not selected:
+                rejected.append({**item, "reject_reason": "LOWER_THESIS_RELEVANCE"})
+
+        structural_level = float(selected["structural_level"])
+        buffer = max(safe_atr * 0.3, tick * 2.0, spread)
+        raw_stop = structural_level - buffer if is_long else structural_level + buffer
+        if tick:
+            units = raw_stop / tick
+            stop = math.floor(units + 1e-12) * tick if is_long else math.ceil(units - 1e-12) * tick
+        else:
+            stop = raw_stop
+        invariant_ok = stop < structural_level if is_long else stop > structural_level
+        side_ok = stop > 0 and (stop < entry_price if is_long else stop > entry_price)
+        return (float(stop) if invariant_ok and side_ok else None), {
+            "policy": "STRUCTURAL_INITIAL_STOP_V2",
+            "entry": float(entry_price), "side": side, "atr": float(safe_atr),
+            "invalidation_level": invalidation,
+            "entry_anchor_level": entry_anchor_level,
+            "selected_thesis_invalidation": structural_level,
+            "thesis_invalidation_source": selected["level_source"],
+            "selected_structural_level": structural_level,
+            "structural_level_type": selected["level_source"],
+            "structural_level_timeframe": selected["timeframe"],
+            "structural_level_created_at": selected["created_at"],
+            "relation_to_thesis": selected["relation_to_thesis"],
+            "selected_strength": selected["strength"],
+            "selection_reason": "HIGHEST_THESIS_INVALIDATION_RELEVANCE",
+            "all_structural_candidates": candidates,
+            "rejected_structural_candidates": rejected,
+            "volatility_buffer": float(buffer),
+            "buffer_components": {
+                "atr_0_3": float(safe_atr * 0.3), "two_ticks": float(tick * 2),
+                "spread": float(spread),
+            },
+            "tick_size": float(tick), "raw_structural_stop": float(raw_stop),
+            "final_sl": float(stop), "final_risk_distance": float(abs(entry_price - stop)),
+            "distance_pct": float(abs(entry_price - stop) / entry_price),
+            "distance_atr": float(abs(entry_price - stop) / safe_atr),
+            "clamp": "NONE", "clamp_attempted": False,
+            "structural_invariant_ok": bool(invariant_ok),
+            "side_invariant_ok": bool(side_ok),
+            "reason": "VALID" if invariant_ok and side_ok else "STRUCTURAL_STOP_INVARIANT_FAILED",
+        }
+
     @staticmethod
     def evaluate_structural_stop_account_risk(*, equity, amount, entry_price, stop_price, round_trip_cost_pct=None):
         """Check actual rounded exposure without changing stop or sizing semantics."""
@@ -569,11 +739,18 @@ class RiskManager:
             invalidation_level=invalidation_level,
             market_levels=market_levels,
         )
+        structural_v2_enabled = bool(
+            getattr(Config, "STRUCTURAL_STOP_V2_ENABLED", False)
+        )
         structural_enabled = bool(
             getattr(Config, "STRUCTURAL_INITIAL_STOP_V1_ENABLED", False)
         )
-        if structural_enabled:
-            sl, stop_plan = self._structural_initial_stop_plan(
+        if structural_v2_enabled or structural_enabled:
+            planner = (
+                self._structural_initial_stop_v2_plan
+                if structural_v2_enabled else self._structural_initial_stop_plan
+            )
+            sl, stop_plan = planner(
                 side, entry_price, safe_atr,
                 invalidation_level=invalidation_level,
                 market_levels=market_levels,

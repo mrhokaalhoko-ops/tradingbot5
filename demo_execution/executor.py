@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 import hashlib
+import threading
 import time
 from typing import Any, Mapping
 
@@ -105,6 +106,7 @@ class DemoBExecutor:
             raise RuntimeError("DEMO_EXECUTOR_POLICY_MUST_BE_MOMENTUM_REPRICED_V1")
         self.reconciliation_ok = False
         self.environment_proof: dict[str, Any] | None = None
+        self._execution_lock = threading.RLock()
 
     @property
     def environment_fields(self) -> dict[str, str]:
@@ -227,6 +229,25 @@ class DemoBExecutor:
         execution_quote: ExecutionQuote | None = None,
         cross_environment_audit: Mapping[str, Any] | None = None,
     ) -> dict:
+        # The capacity and same-symbol checks must be atomic inside this
+        # process. Exchange reconciliation remains the cross-restart source
+        # of truth.
+        with self._execution_lock:
+            return self._execute_candidate_locked(
+                snapshot,
+                exchange_filter,
+                execution_quote=execution_quote,
+                cross_environment_audit=cross_environment_audit,
+            )
+
+    def _execute_candidate_locked(
+        self,
+        snapshot: MarketSnapshot,
+        exchange_filter: dict[str, Any],
+        *,
+        execution_quote: ExecutionQuote | None = None,
+        cross_environment_audit: Mapping[str, Any] | None = None,
+    ) -> dict:
         if not self.config.enabled:
             raise DemoBinanceError("DEMO_EXECUTION_DISABLED")
         if not self.reconciliation_ok:
@@ -250,6 +271,20 @@ class DemoBExecutor:
             return {"status": "DUPLICATE_CANDIDATE", "candidate_id": candidate.candidate_id}
 
         try:
+            same_symbol_local = [
+                row for row in self.store.active()
+                if row["candidate_id"] != candidate.candidate_id
+                and row["symbol"] == snapshot.symbol
+            ]
+            if same_symbol_local:
+                return self.store.update(
+                    candidate.candidate_id, "SKIPPED_SYMBOL_ACTIVE",
+                    symbol_guard_source="LOCAL_ACTIVE_LIFECYCLE",
+                    conflicting_candidate_ids=[
+                        row["candidate_id"] for row in same_symbol_local
+                    ],
+                )
+
             if self.signal_market_environment == SIGNAL_MARKET_ENVIRONMENT:
                 audit = dict(cross_environment_audit or {})
                 audit_reasons = verify_cross_environment_audit(
@@ -266,6 +301,16 @@ class DemoBExecutor:
                 row for row in self.client.position_risk()
                 if abs(_position_amount(row)) > 0
             ]
+            same_symbol_exchange = [
+                row for row in positions
+                if str(row.get("symbol") or "") == snapshot.symbol
+            ]
+            if same_symbol_exchange:
+                return self.store.update(
+                    candidate.candidate_id, "SKIPPED_SYMBOL_ACTIVE",
+                    symbol_guard_source="EXCHANGE_OPEN_POSITION",
+                    exchange_position_count=len(same_symbol_exchange),
+                )
             if len(positions) >= self.effective_position_cap:
                 return self.store.update(
                     candidate.candidate_id, "SKIPPED_CAPACITY",
@@ -280,14 +325,11 @@ class DemoBExecutor:
                     decision_status=decision.status,
                 )
             if execution_quote is None:
-                execution_quote = ExecutionQuote(
-                    symbol=snapshot.symbol,
-                    event_time=snapshot.quote.observed_at,
-                    received_at=datetime.now(timezone.utc),
-                    best_bid=snapshot.quote.best_bid,
-                    best_ask=snapshot.quote.best_ask,
-                    update_id=int(snapshot.quote.observed_at.timestamp() * 1000),
-                    source="BINANCE_DEMO_PUBLIC_REST_BOOK_TICKER",
+                return self.store.update(
+                    candidate.candidate_id,
+                    "SKIPPED_EXECUTION_QUOTE_UNAVAILABLE",
+                    quote_required=True,
+                    snapshot_quote_reused=False,
                 )
             if execution_quote.event_time < decision.entry_ready_at:
                 return self.store.update(
@@ -324,12 +366,25 @@ class DemoBExecutor:
             )
             return self._submit_entry(snapshot, geometry, exchange_filter)
         except Exception as exc:
-            self.store.update(
-                candidate.candidate_id, "FAILED_CLOSED",
-                failure=f"{type(exc).__name__}:{exc}",
-            )
+            current = self.store.get(candidate.candidate_id)
+            current_state = str((current or {}).get("state") or "")
+            if current_state.startswith("EMERGENCY_EXIT_"):
+                self.store.update(
+                    candidate.candidate_id, current_state,
+                    failure=f"{type(exc).__name__}:{exc}",
+                    reconciliation_required=True,
+                )
+            else:
+                self.store.update(
+                    candidate.candidate_id, "FAILED_CLOSED",
+                    failure=f"{type(exc).__name__}:{exc}",
+                )
             self.store.event(
-                "FAILED_CLOSED",
+                (
+                    "EMERGENCY_EXIT_EXCEPTION"
+                    if current_state.startswith("EMERGENCY_EXIT_")
+                    else "FAILED_CLOSED"
+                ),
                 self._event_payload({"error": f"{type(exc).__name__}:{exc}"}),
                 candidate.candidate_id,
             )
@@ -610,12 +665,12 @@ class DemoBExecutor:
             candidate_id,
         )
         if actual_rr < self.config.min_actual_rr:
-            exit_order = self.client.create_reduce_only_market_exit(
-                symbol, _format_number(filled_qty), _client_id("x", candidate_id)
-            )
-            return self.store.update(
-                candidate_id, "CLOSED_POST_FILL_RR_REJECTED",
-                emergency_exit=exit_order,
+            return self._emergency_close_and_confirm(
+                candidate_id,
+                symbol,
+                filled_qty,
+                reason="POST_FILL_RR_REJECTED",
+                terminal_state="CLOSED_POST_FILL_RR_REJECTED",
             )
         return self._protect_fill(candidate_id, symbol, filled_qty)
 
@@ -721,6 +776,199 @@ class DemoBExecutor:
             client_id=client_id,
         )
 
+    def _cleanup_protection_after_flat(
+        self, payload: Mapping[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        canceled = []
+        failures = []
+        for leg in ("stop", "tp"):
+            try:
+                self._cancel_algo_leg_if_present(payload, leg)
+                identity = str(
+                    payload.get(f"{leg}_order_id")
+                    or payload.get(f"{leg}_client_id")
+                    or ""
+                )
+                if identity:
+                    canceled.append(identity)
+            except Exception as exc:
+                failures.append(f"{leg}:{type(exc).__name__}:{exc}")
+        return canceled, failures
+
+    @staticmethod
+    def _confirmed_exit_fill(
+        order: Mapping[str, Any] | None,
+        requested_quantity: float,
+    ) -> tuple[bool, str, float]:
+        order = dict(order or {})
+        status = str(order.get("status") or "").upper()
+        try:
+            executed_quantity = float(order.get("executedQty") or 0.0)
+        except (TypeError, ValueError):
+            executed_quantity = 0.0
+        confirmed = (
+            status == "FILLED"
+            and requested_quantity > 0
+            and executed_quantity + 1e-12 >= requested_quantity
+        )
+        return confirmed, status, executed_quantity
+
+    def _query_emergency_exit(
+        self,
+        symbol: str,
+        *,
+        order: Mapping[str, Any] | None,
+        client_id: str,
+        requested_quantity: float,
+    ) -> tuple[dict | None, str | None]:
+        current = dict(order or {})
+        confirmed, _status, _executed = self._confirmed_exit_fill(
+            current, requested_quantity
+        )
+        if confirmed:
+            return current, None
+        try:
+            queried = self.client.query_order(
+                symbol,
+                order_id=current.get("orderId") or None,
+                client_id=client_id,
+            )
+        except Exception as exc:
+            return current or None, f"{type(exc).__name__}:{exc}"
+        return dict(queried), None
+
+    def _emergency_close_and_confirm(
+        self,
+        candidate_id: str,
+        symbol: str,
+        quantity: float,
+        *,
+        reason: str,
+        terminal_state: str,
+    ) -> dict:
+        """Submit one reduce-only exit and prove flatness before terminal state.
+
+        A POST ambiguity is resolved only by querying the deterministic client
+        id. Protection is intentionally retained until the exchange position
+        is proven flat.
+        """
+        self.reconciliation_ok = False
+        exit_client_id = _client_id("x", candidate_id)
+        self.store.update(
+            candidate_id,
+            "EMERGENCY_EXIT_PENDING",
+            emergency_reason=reason,
+            emergency_terminal_state=terminal_state,
+            emergency_exit_client_id=exit_client_id,
+            emergency_exit_requested_qty=float(quantity),
+            emergency_exit_requested_at=_utc_now(),
+            reconciliation_required=True,
+        )
+        submit_failure = None
+        try:
+            exit_order = self.client.create_reduce_only_market_exit(
+                symbol, _format_number(quantity), exit_client_id
+            )
+        except Exception as submit_exc:
+            submit_failure = f"{type(submit_exc).__name__}:{submit_exc}"
+            self.store.update(
+                candidate_id,
+                "EMERGENCY_EXIT_UNKNOWN",
+                emergency_exit_submit_failure=submit_failure,
+                emergency_exit_post_retried=False,
+            )
+            exit_order = None
+
+        exit_order, lookup_failure = self._query_emergency_exit(
+            symbol,
+            order=exit_order,
+            client_id=exit_client_id,
+            requested_quantity=float(quantity),
+        )
+        confirmed, exit_status, executed_quantity = self._confirmed_exit_fill(
+            exit_order, float(quantity)
+        )
+        if lookup_failure or not confirmed:
+            state = "EMERGENCY_EXIT_UNKNOWN" if submit_failure else "EMERGENCY_EXIT_RECONCILIATION"
+            return self.store.update(
+                candidate_id,
+                state,
+                emergency_exit=exit_order,
+                emergency_exit_order_id=str((exit_order or {}).get("orderId") or ""),
+                emergency_exit_lookup_failure=lookup_failure,
+                emergency_exit_confirmed=False,
+                emergency_exit_status=exit_status,
+                emergency_exit_executed_qty=executed_quantity,
+                emergency_exit_post_retried=False,
+                reconciliation_required=True,
+            )
+
+        self.store.update(
+            candidate_id,
+            "EMERGENCY_EXIT_RECONCILIATION",
+            emergency_exit=exit_order,
+            emergency_exit_order_id=str(exit_order.get("orderId") or ""),
+            emergency_exit_confirmed=True,
+            emergency_exit_status=exit_status,
+            emergency_exit_executed_qty=executed_quantity,
+            emergency_exit_post_retried=False,
+        )
+        try:
+            remaining = [
+                row for row in self.client.position_risk()
+                if str(row.get("symbol") or "") == symbol
+                and abs(_position_amount(row)) > 0
+            ]
+        except Exception as exc:
+            return self.store.update(
+                candidate_id,
+                "EMERGENCY_EXIT_RECONCILIATION",
+                emergency_flat_check_failure=f"{type(exc).__name__}:{exc}",
+                reconciliation_required=True,
+            )
+        if remaining:
+            return self.store.update(
+                candidate_id,
+                "EMERGENCY_EXIT_RECONCILIATION",
+                emergency_position_still_open=True,
+                emergency_remaining_position=remaining,
+                reconciliation_required=True,
+            )
+
+        payload = self.store.get(candidate_id)["payload"]
+        canceled, failures = self._cleanup_protection_after_flat(payload)
+        if failures:
+            return self.store.update(
+                candidate_id,
+                "EMERGENCY_EXIT_CLEANUP_PENDING",
+                emergency_position_confirmed_flat=True,
+                protection_canceled_after_flat=canceled,
+                protection_cleanup_failures=failures,
+                reconciliation_required=True,
+            )
+        closed = self.store.update(
+            candidate_id,
+            terminal_state,
+            emergency_position_confirmed_flat=True,
+            protection_canceled_after_flat=canceled,
+            protection_cleanup_failures=[],
+            reconciliation_required=True,
+            emergency_closed_at=_utc_now(),
+        )
+        self.store.event(
+            "EMERGENCY_EXIT_CONFIRMED",
+            self._event_payload({
+                "symbol": symbol,
+                "reason": reason,
+                "terminal_state": terminal_state,
+                "exit_order_id": str(exit_order.get("orderId") or ""),
+                "position_confirmed_flat": True,
+                "protection_canceled_after_flat": canceled,
+            }),
+            candidate_id,
+        )
+        return closed
+
     def _protect_fill(self, candidate_id: str, symbol: str, filled_qty: float) -> dict:
         row = self.store.get(candidate_id)
         if row["state"] == "PROTECTED":
@@ -748,25 +996,17 @@ class DemoBExecutor:
             )
         except Exception as exc:
             self.reconciliation_ok = False
-            latest = self.store.get(candidate_id)["payload"]
-            cancel_failures = []
-            for leg in ("stop", "tp"):
-                try:
-                    self._cancel_algo_leg_if_present(latest, leg)
-                except Exception as cancel_exc:
-                    cancel_failures.append(
-                        f"{leg}:{type(cancel_exc).__name__}:{cancel_exc}"
-                    )
-            emergency = self.client.create_reduce_only_market_exit(
-                symbol, quantity, _client_id("x", candidate_id)
-            )
             self.store.update(
-                candidate_id, "EMERGENCY_CLOSED_PROTECTION_FAILURE",
-                emergency_exit=emergency,
+                candidate_id, "PROTECTION_PENDING",
                 protection_failure=f"{type(exc).__name__}:{exc}",
-                protection_cancel_failures=cancel_failures,
             )
-            raise
+            return self._emergency_close_and_confirm(
+                candidate_id,
+                symbol,
+                filled_qty,
+                reason="PROTECTION_FAILURE",
+                terminal_state="EMERGENCY_CLOSED_PROTECTION_FAILURE",
+            )
         protected = self.store.update(
             candidate_id, "PROTECTED",
             stop_order_id=_algo_order_id(stop_order),
@@ -801,6 +1041,7 @@ class DemoBExecutor:
         self.reconciliation_ok = False
         mismatches: list[str] = []
         cleaned_orphans: list[str] = []
+        emergency_cleaned_algo_ids: set[str] = set()
         retry_history_before = len(
             getattr(self.client, "reconciliation_retry_history", [])
         )
@@ -869,6 +1110,78 @@ class DemoBExecutor:
                             f"{type(exc).__name__}:{exc}"
                         )
                 continue
+            if state.startswith("EMERGENCY_EXIT_"):
+                exit_client_id = str(payload.get("emergency_exit_client_id") or "")
+                requested_quantity = float(
+                    payload.get("emergency_exit_requested_qty")
+                    or payload.get("filled_qty")
+                    or 0.0
+                )
+                exit_order, lookup_failure = self._query_emergency_exit(
+                    symbol,
+                    order=payload.get("emergency_exit"),
+                    client_id=exit_client_id,
+                    requested_quantity=requested_quantity,
+                )
+                confirmed, exit_status, executed_quantity = self._confirmed_exit_fill(
+                    exit_order, requested_quantity
+                )
+                if lookup_failure or not confirmed:
+                    self.store.update(
+                        candidate_id,
+                        "EMERGENCY_EXIT_UNKNOWN" if lookup_failure else state,
+                        emergency_exit=exit_order,
+                        emergency_exit_lookup_failure=lookup_failure,
+                        emergency_exit_confirmed=False,
+                        emergency_exit_status=exit_status,
+                        emergency_exit_executed_qty=executed_quantity,
+                        reconciliation_required=True,
+                    )
+                    mismatches.append(
+                        f"EMERGENCY_EXIT_QUERY_UNKNOWN:{candidate_id}"
+                        if lookup_failure
+                        else f"EMERGENCY_EXIT_NOT_FILLED:{candidate_id}:"
+                        f"{exit_status}:{executed_quantity}/{requested_quantity}"
+                    )
+                    continue
+                if symbol in positions:
+                    mismatches.append(
+                        f"EMERGENCY_EXIT_UNRESOLVED:{candidate_id}:{state}"
+                    )
+                    continue
+                canceled, failures = self._cleanup_protection_after_flat(payload)
+                if failures:
+                    self.store.update(
+                        candidate_id,
+                        "EMERGENCY_EXIT_CLEANUP_PENDING",
+                        emergency_position_confirmed_flat=True,
+                        protection_canceled_after_flat=canceled,
+                        protection_cleanup_failures=failures,
+                        reconciliation_required=True,
+                    )
+                    mismatches.append(
+                        f"EMERGENCY_PROTECTION_CLEANUP_UNRESOLVED:{candidate_id}"
+                    )
+                    continue
+                terminal_state = str(
+                    payload.get("emergency_terminal_state")
+                    or "EMERGENCY_CLOSED_RECONCILED"
+                )
+                self.store.update(
+                    candidate_id,
+                    terminal_state,
+                    emergency_exit=exit_order,
+                    emergency_exit_confirmed=True,
+                    emergency_exit_status=exit_status,
+                    emergency_exit_executed_qty=executed_quantity,
+                    emergency_position_confirmed_flat=True,
+                    protection_canceled_after_flat=canceled,
+                    protection_cleanup_failures=[],
+                    reconciliation_required=False,
+                    emergency_reconciled_at=_utc_now(),
+                )
+                emergency_cleaned_algo_ids.update(canceled)
+                continue
             if state == "PROTECTED":
                 if symbol in positions:
                     required = {
@@ -914,6 +1227,8 @@ class DemoBExecutor:
         for order in open_algo_orders:
             client_id = str(order.get("clientAlgoId") or "")
             algo_id = _algo_order_id(order)
+            if algo_id in emergency_cleaned_algo_ids or client_id in emergency_cleaned_algo_ids:
+                continue
             if client_id.startswith(CLIENT_PREFIX) and algo_id not in active_algo_ids:
                 self.client.cancel_algo_order(algo_id=algo_id or None, client_id=client_id)
                 cleaned_orphans.append(f"algo:{algo_id or client_id}")
