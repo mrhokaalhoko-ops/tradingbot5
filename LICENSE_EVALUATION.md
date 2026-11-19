@@ -16,7 +16,7 @@ This is an engineering assessment, not legal advice.
 
 ## Dependency review
 
-The declared runtime/development packages inspected locally reported MIT, BSD-family, or Apache-family licenses, including CCXT, pandas, NumPy, TA, Requests, python-dotenv, Groq, psutil, Flask, websockets, OpenAI, Google Generative AI, cachetools, jsonschema, pytest, PyArrow, Ruff, Bandit, and pip-audit. These are generally compatible with MIT, Apache-2.0, and GPL-3.0 aggregation/use.
+The declared runtime/development packages inspected locally reported MIT, BSD-family, or Apache-family licenses, including CCXT, pandas, NumPy, TA, Requests, python-dotenv, Groq, psutil, Flask, websockets, OpenAI, Google Generative AI, cachetools, jsonschema, pytest, PyArrow, scikit-learn, Ruff, Bandit, and pip-audit. These are generally compatible with MIT, Apache-2.0, and GPL-3.0 aggregation/use.
 
 The developer machine contains unrelated packages under GPL/LGPL/MPL licenses, but they are not declared TradingBot5 dependencies and are not part of this assessment. A clean-environment SBOM and license scan must be repeated for a release. Dependency licenses do not resolve ownership of this repository's source or assets.
 

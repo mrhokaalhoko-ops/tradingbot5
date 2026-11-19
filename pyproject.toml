@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-minversion = "7.4"
+minversion = "9.0.3"
 testpaths = ["tests"]
 addopts = "--strict-config"
 filterwarnings = [
