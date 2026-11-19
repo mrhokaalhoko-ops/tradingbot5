@@ -1,0 +1,9 @@
+# Replace or extend this list when additional maintainers accept responsibility.
+* @mrhokaalhoko-ops
+
+# Security- and execution-sensitive surfaces require owner review.
+/core/ @mrhokaalhoko-ops
+/demo_execution/ @mrhokaalhoko-ops
+/strategy/risk_manager.py @mrhokaalhoko-ops
+/.github/workflows/ @mrhokaalhoko-ops
+/SECURITY.md @mrhokaalhoko-ops
