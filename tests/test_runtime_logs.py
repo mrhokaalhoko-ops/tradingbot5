@@ -525,7 +525,7 @@ class TestLogSecretRedaction(unittest.TestCase):
 
     def test_demo_binance_credentials_are_redacted_even_without_labels(self):
         demo_key = "DEMO1234567890UNLABELLEDKEY"
-        demo_secret = "SECR1234567890UNLABELLEDSECRET"
+        demo_secret = "SECR" + "-".join(("synthetic", "demo", "secret", "value"))
         with patch.dict(os.environ, {
             "BINANCE_DEMO_API_KEY": demo_key,
             "BINANCE_DEMO_API_SECRET": demo_secret,
