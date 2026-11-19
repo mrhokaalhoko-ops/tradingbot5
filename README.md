@@ -6,7 +6,7 @@ TradingBot5 is a Python algorithmic-trading research and Binance USD-M Demo exec
 
 ## Status
 
-- Python 3.10 and 3.11 are tested in CI.
+- CI is configured to test Python 3.10 and 3.11; the local final run used Python 3.10.
 - Automated execution defaults off and testnet defaults on.
 - Live mode requires a separate, exact operator confirmation before any exchange client is created.
 - Tests use mocks, fixtures, and local stores; they do not place real orders.
@@ -173,3 +173,5 @@ Priorities are incremental orchestration/Telegram extraction, validated immutabl
 ## License status
 
 **No open-source license is currently granted.** Source availability alone does not grant permission to use, modify, or redistribute. [LICENSE_EVALUATION.md](LICENSE_EVALUATION.md) recommends Apache-2.0, subject to owner authorization and provenance review of imported code and assets. No `LICENSE` file will be added until that decision is complete.
+
+The implementation and verification record for this readiness pass is in [FINAL_ENGINEERING_REPORT.md](FINAL_ENGINEERING_REPORT.md).
