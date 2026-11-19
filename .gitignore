@@ -25,6 +25,12 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.test-data/
 
 # Data / reports
 testnet_trades_log.csv

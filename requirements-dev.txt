@@ -1,3 +1,7 @@
 -r requirements.txt
-pytest
-pyarrow
+pytest>=7.4,<9.0
+pytest-cov>=4.1,<7.0
+pyarrow>=14,<23
+ruff>=0.9,<1.0
+bandit>=1.8,<2.0
+pip-audit>=2.7,<3.0

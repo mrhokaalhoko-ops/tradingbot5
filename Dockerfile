@@ -6,8 +6,7 @@ WORKDIR /app
 
 # نسخ ملف المتطلبات وتثبيتها
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir jsonschema==4.25.1
+RUN pip install --no-cache-dir -r requirements.txt
 
 # نسخ باقي ملفات المشروع
 COPY . .

@@ -48,9 +48,7 @@ def test_demo_bridge_rejects_mainnet_and_missing_credentials():
             config(TELEGRAM_PROPOSAL_DEMO_MODE=True, USE_TESTNET=False)
         )
     with pytest.raises(RuntimeError, match="CREDENTIALS_MISSING"):
-        validate_telegram_proposal_demo_mode(
-            config(TELEGRAM_PROPOSAL_DEMO_MODE=True)
-        )
+        validate_telegram_proposal_demo_mode(config(TELEGRAM_PROPOSAL_DEMO_MODE=True))
 
 
 def test_demo_bridge_reports_bounded_cap_only_when_execution_is_enabled():
