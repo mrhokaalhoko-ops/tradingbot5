@@ -15,4 +15,4 @@ COPY . .
 # هذا الفرع يشغّل عقل Telegram الحالي نفسه داخل خدمة Demo المعزولة. حراس
 # TELEGRAM_PROPOSAL_DEMO_MODE/DEMO_EXECUTION_ENABLED يمنعون أي أمر خارج
 # demo-fapi.binance.com، ولا تُمنح رسائل watchlist/shadow صلاحية تنفيذ.
-CMD ["python", "-u", "main.py"]
+CMD ["python", "-u", "app.py"]

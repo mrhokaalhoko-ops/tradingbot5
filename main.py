@@ -47,6 +47,10 @@ from utils.state_manager import StateManager
 from utils.performance_tracker import PerformanceTracker
 from utils.candle_sync import seconds_to_next_candle
 from core.config import Config
+from core.startup import (
+    validate_live_trading_confirmation as _validate_live_trading_confirmation,
+    validate_telegram_proposal_demo_mode as _validate_telegram_proposal_demo_mode,
+)
 from core.universe_filter import UniverseFilter
 from filters.derivatives_risk_filter import DerivativesRiskFilter
 from utils.api_status_monitor import APIStatusMonitor
@@ -8285,41 +8289,12 @@ def _run_api_health_check(api_status_monitor):
 
 def validate_live_trading_confirmation():
     """يرفض وضع LIVE قبل إنشاء أي عميل أو اتصال خارجي."""
-    if (
-        not Config.USE_TESTNET
-        and os.getenv("LIVE_TRADING_CONFIRMATION") != "I_ACCEPT_REAL_MONEY_RISK"
-    ):
-        raise RuntimeError(
-            "Live trading blocked: LIVE_TRADING_CONFIRMATION is missing or incorrect."
-        )
-    return True
+    return _validate_live_trading_confirmation(Config)
 
 
 def validate_telegram_proposal_demo_mode():
     """Reject an unsafe bridge configuration before ExchangeClient exists."""
-    if not Config.TELEGRAM_PROPOSAL_DEMO_MODE:
-        return {"enabled": False}
-    if not Config.USE_TESTNET:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_MODE_REQUIRES_USE_TESTNET_TRUE")
-    if not Config.BINANCE_API_KEY or not Config.BINANCE_API_SECRET:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_CREDENTIALS_MISSING")
-    if int(Config.LEVERAGE) != 5:
-        raise RuntimeError("TELEGRAM_PROPOSAL_DEMO_REQUIRES_5X_LEVERAGE")
-    return {
-        "enabled": True,
-        "execution_enabled": bool(Config.DEMO_EXECUTION_ENABLED),
-        "effective_position_cap": (
-            min(
-                int(Config.TESTNET_MAX_OPEN_TRADES),
-                int(Config.HARD_MAX_OPEN_TRADES),
-            )
-            if Config.DEMO_EXECUTION_ENABLED
-            else 0
-        ),
-        "telegram_polling_enabled": bool(Config.TELEGRAM_POLLING_ENABLED),
-        "telegram_outbound_enabled": bool(Config.TELEGRAM_OUTBOUND_ENABLED),
-        "account_management_enabled": bool(Config.ACCOUNT_MANAGEMENT_ENABLED),
-    }
+    return _validate_telegram_proposal_demo_mode(Config)
 
 
 def _release_writer_lease(writer_lease):
